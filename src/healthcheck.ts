@@ -8,9 +8,13 @@ async function main(): Promise<void> {
   try {
     await redis.ping();
 
-    const { error } = await supabase.storage.getBucket(config.supabase.bucket);
+    const { error } = await supabase.storage.from(config.supabase.bucket).list("", {
+      limit: 1,
+    });
     if (error) {
-      throw new Error(`Supabase bucket check failed: ${error.message}`);
+      throw new Error(
+        `Supabase storage check failed for bucket "${config.supabase.bucket}": ${error.message}`,
+      );
     }
   } finally {
     await redis.quit();

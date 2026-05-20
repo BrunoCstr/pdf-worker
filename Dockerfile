@@ -31,6 +31,9 @@ RUN npm ci --omit=dev
 
 COPY --from=build /app/dist ./dist
 
-HEALTHCHECK NONE
+# Coolify lê HEALTHCHECK do Dockerfile. Não use HEALTHCHECK NONE — o Coolify ainda
+# espera .State.Health e falha com "map has no entry for key Health".
+HEALTHCHECK --interval=30s --timeout=15s --start-period=45s --retries=3 \
+  CMD ["node", "dist/healthcheck.js"]
 
 CMD ["node", "dist/worker.js"]

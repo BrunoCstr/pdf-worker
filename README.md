@@ -154,6 +154,8 @@ node -e "const { Queue } = require('bullmq'); const IORedis = require('ioredis')
 
 **Variáveis no Coolify:** marque `NODE_ENV`, `REDIS_URL`, `SUPABASE_SECRET_KEY`, `WORKER_API_SECRET` e demais secrets como **Runtime only** (não "Available at Buildtime"). Com `NODE_ENV=production` no build, o `npm ci` pula `typescript` e o deploy falha com `tsc: not found`. O `Dockerfile` já força devDependencies no stage de build, mas evitar secrets no buildtime também é mais seguro.
 
+**Health check no Coolify:** este worker não expõe HTTP. Use o health check do `Dockerfile` (`node dist/healthcheck.js` — Redis + Storage). **Não** use `HEALTHCHECK NONE` (o Coolify ainda tenta ler `.State.Health` e o deploy falha com `map has no entry for key "Health"`). Na UI do app, deixe o health check **desligado** se for tipo HTTP/porta; o rolling update usa o `HEALTHCHECK` da imagem. Se o deploy falhar após ~45s, confira os logs do container e rode localmente `npm run build && npm run healthcheck` com as mesmas variáveis — falhas comuns: `REDIS_URL` inacessível do VPS (use `rediss://` do Upstash, não `localhost`) ou `SUPABASE_SECRET_KEY` / `SUPABASE_BUCKET` incorretos.
+
 ## Rollback
 
 Mantenha a feature flag `USE_EXTERNAL_PDF_WORKER=false` no `tropa-do-soi` para voltar à compressão inline legada. O worker pode continuar deployado; basta parar de enfileirar novos jobs. Jobs já pendentes podem ser drenados ou removidos manualmente no Redis.

@@ -1,9 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { Queue } from "bullmq";
-import IORedis from "ioredis";
 
 import { config } from "./config";
+import { createRedisConnection } from "./redis";
 
 export type DrivePdfOptimizeJob = {
   fileId: string;
@@ -25,11 +25,7 @@ export type FailedDrivePdfJob = {
   failedAt: string;
 };
 
-export function createRedisConnection(): IORedis {
-  return new IORedis(config.redis.url, {
-    maxRetriesPerRequest: null,
-  });
-}
+export { createRedisConnection } from "./redis";
 
 export const redisConnection = createRedisConnection();
 

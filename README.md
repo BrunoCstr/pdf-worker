@@ -131,9 +131,10 @@ npm run build
 npm start
 ```
 
-Healthcheck:
+Healthcheck (carrega `.env` via `--env-file`; no Docker/Coolify as variáveis vêm do ambiente do container):
 
 ```bash
+npm run build
 npm run healthcheck
 ```
 

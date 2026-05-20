@@ -26,11 +26,7 @@ export type FailedDrivePdfJob = {
 };
 
 export function createRedisConnection(): IORedis {
-  return new IORedis({
-    host: config.redis.host,
-    port: config.redis.port,
-    password: config.redis.password,
-    tls: config.redis.tls ? {} : undefined,
+  return new IORedis(config.redis.url, {
     maxRetriesPerRequest: null,
   });
 }

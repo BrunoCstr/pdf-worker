@@ -3,17 +3,15 @@ type NodeEnv = "development" | "test" | "production";
 export type AppConfig = {
   nodeEnv: NodeEnv;
   redis: {
-    host: string;
-    port: number;
-    password?: string;
-    tls: boolean;
+    url: string;
   };
   queueName: string;
   dlqName: string;
   workerConcurrency: number;
   supabase: {
     url: string;
-    serviceRoleKey: string;
+    /** Chave server-side (SUPABASE_SECRET_KEY no app principal). */
+    secretKey: string;
     bucket: string;
   };
   limits: {
@@ -78,6 +76,46 @@ function readBoolean(name: string, fallback: boolean): boolean {
   throw new Error(`Environment variable ${name} must be boolean-like`);
 }
 
+function readRedisUrl(): string {
+  const url = readOptional("REDIS_URL");
+  if (url) {
+    if (!/^rediss?:\/\//i.test(url)) {
+      throw new Error("REDIS_URL must start with redis:// or rediss://");
+    }
+
+    return url;
+  }
+
+  const host = readOptional("REDIS_HOST");
+  if (host) {
+    const port = readNumber("REDIS_PORT", 6379, { min: 1, max: 65535 });
+    const password = readOptional("REDIS_PASSWORD");
+    const tls = readBoolean("REDIS_TLS", false);
+    const scheme = tls ? "rediss" : "redis";
+    const auth = password ? `:${encodeURIComponent(password)}@` : "";
+
+    return `${scheme}://${auth}${host}:${port}`;
+  }
+
+  throw new Error("Missing REDIS_URL (ex.: redis://localhost:6379 ou rediss://... do Upstash)");
+}
+
+function readSupabaseSecretKey(): string {
+  const secretKey = readOptional("SUPABASE_SECRET_KEY");
+  if (secretKey) {
+    return secretKey;
+  }
+
+  const legacyServiceRoleKey = readOptional("SUPABASE_SERVICE_ROLE_KEY");
+  if (legacyServiceRoleKey) {
+    return legacyServiceRoleKey;
+  }
+
+  throw new Error(
+    "Missing Supabase server key: set SUPABASE_SECRET_KEY (same value as in the Next.js app)",
+  );
+}
+
 function readNodeEnv(): NodeEnv {
   const value = readOptional("NODE_ENV") ?? "production";
 
@@ -91,17 +129,14 @@ function readNodeEnv(): NodeEnv {
 export const config: AppConfig = {
   nodeEnv: readNodeEnv(),
   redis: {
-    host: readRequired("REDIS_HOST"),
-    port: readNumber("REDIS_PORT", 6379, { min: 1, max: 65535 }),
-    password: readOptional("REDIS_PASSWORD"),
-    tls: readBoolean("REDIS_TLS", false),
+    url: readRedisUrl(),
   },
   queueName: readOptional("BULLMQ_QUEUE_NAME") ?? "drive-pdf-optimize",
   dlqName: readOptional("BULLMQ_DLQ_NAME") ?? "drive-pdf-failed",
   workerConcurrency: readNumber("WORKER_CONCURRENCY", 1, { min: 1 }),
   supabase: {
     url: readRequired("SUPABASE_URL"),
-    serviceRoleKey: readRequired("SUPABASE_SERVICE_ROLE_KEY"),
+    secretKey: readSupabaseSecretKey(),
     bucket: readOptional("SUPABASE_BUCKET") ?? "user-files",
   },
   limits: {

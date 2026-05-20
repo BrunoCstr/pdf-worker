@@ -1,5 +1,8 @@
 FROM node:22-bookworm-slim AS build
 
+# Coolify (e outros) podem injetar NODE_ENV=production no build e pular devDependencies.
+ENV NODE_ENV=development
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ghostscript \
   && rm -rf /var/lib/apt/lists/*
@@ -7,7 +10,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --include=dev
 
 COPY tsconfig.json ./
 COPY src ./src

@@ -1,15 +1,9 @@
 import { config } from "./config";
-import IORedis from "ioredis";
+import { createRedisConnection } from "./queue";
 import { supabase } from "./services/supabase";
 
 async function main(): Promise<void> {
-  const redis = new IORedis({
-    host: config.redis.host,
-    port: config.redis.port,
-    password: config.redis.password,
-    tls: config.redis.tls ? {} : undefined,
-    maxRetriesPerRequest: null,
-  });
+  const redis = createRedisConnection();
 
   try {
     await redis.ping();

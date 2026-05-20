@@ -40,10 +40,11 @@ brew install ghostscript
 
 Veja `.env.example`. Valores importantes:
 
+- `REDIS_URL` (ex.: `redis://localhost:6379` ou `rediss://...` do Upstash — mesma URL no Next e na VPS)
 - `BULLMQ_QUEUE_NAME=drive-pdf-optimize`
 - `BULLMQ_DLQ_NAME=drive-pdf-failed`
 - `WORKER_CONCURRENCY=1`
-- `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_URL` e `SUPABASE_SECRET_KEY` (a mesma chave server-side do `tropa-do-soi`; nao use `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` no worker)
 - `SUPABASE_BUCKET=user-files`
 - `DRIVE_PDF_COMPRESS_MAX_BYTES=524288000`
 - `DRIVE_MIN_COMPRESSION_REDUCTION=0.05`
@@ -92,13 +93,10 @@ type DrivePdfOptimizeJob = {
   signature?: string;
 };
 
+import IORedis from "ioredis";
+
 const queue = new Queue<DrivePdfOptimizeJob>("drive-pdf-optimize", {
-  connection: {
-    host: process.env.REDIS_HOST!,
-    port: Number(process.env.REDIS_PORT ?? 6379),
-    password: process.env.REDIS_PASSWORD || undefined,
-    tls: process.env.REDIS_TLS === "true" ? {} : undefined,
-  },
+  connection: new IORedis(process.env.REDIS_URL!, { maxRetriesPerRequest: null }),
 });
 
 function signPayload(job: DrivePdfOptimizeJob): string | undefined {
@@ -142,7 +140,7 @@ npm run healthcheck
 Inspecionar DLQ:
 
 ```bash
-node -e "const { Queue } = require('bullmq'); const q = new Queue(process.env.BULLMQ_DLQ_NAME || 'drive-pdf-failed', { connection: { host: process.env.REDIS_HOST, port: Number(process.env.REDIS_PORT || 6379), password: process.env.REDIS_PASSWORD || undefined, tls: process.env.REDIS_TLS === 'true' ? {} : undefined } }); q.getJobs(['waiting','delayed','failed'], 0, 20).then(j => console.log(j.map(x => ({ id: x.id, data: x.data })))).finally(() => q.close())"
+node -e "const { Queue } = require('bullmq'); const IORedis = require('ioredis'); const conn = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null }); const q = new Queue(process.env.BULLMQ_DLQ_NAME || 'drive-pdf-failed', { connection: conn }); q.getJobs(['waiting','delayed','failed'], 0, 20).then(j => console.log(j.map(x => ({ id: x.id, data: x.data })))).finally(async () => { await q.close(); await conn.quit(); })"
 ```
 
 ## Deploy Coolify
@@ -153,6 +151,8 @@ node -e "const { Queue } = require('bullmq'); const q = new Queue(process.env.BU
 4. Garanta que `gs` está disponível pela imagem Docker.
 5. Use Redis público/TLS compartilhado com o app Vercel.
 6. Monitore memória antes de subir concorrência para `2`, especialmente para PDFs acima de 100 MB.
+
+**Variáveis no Coolify:** marque `NODE_ENV`, `REDIS_URL`, `SUPABASE_SECRET_KEY`, `WORKER_API_SECRET` e demais secrets como **Runtime only** (não "Available at Buildtime"). Com `NODE_ENV=production` no build, o `npm ci` pula `typescript` e o deploy falha com `tsc: not found`. O `Dockerfile` já força devDependencies no stage de build, mas evitar secrets no buildtime também é mais seguro.
 
 ## Rollback
 

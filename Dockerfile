@@ -31,7 +31,6 @@ RUN npm ci --omit=dev
 
 COPY --from=build /app/dist ./dist
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD node dist/healthcheck.js
+HEALTHCHECK NONE
 
 CMD ["node", "dist/worker.js"]

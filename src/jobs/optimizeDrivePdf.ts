@@ -1,6 +1,6 @@
 import { performance } from "node:perf_hooks";
 
-import { config } from "../config";
+import { computeGhostscriptTimeoutMs, config } from "../config";
 import type { DrivePdfOptimizeJob } from "../queue";
 import { compressPdfWithGhostscript } from "../services/compressPdf";
 import {
@@ -77,9 +77,16 @@ export async function optimizeDrivePdfJob(
 
     await markPdfJobCompressingBestEffort(payload.jobId);
 
+    const ghostscriptTimeoutMs = computeGhostscriptTimeoutMs(payload.originalSizeBytes);
+
     const compression = await compressPdfWithGhostscriptAndReportProgress(
       payload.jobId,
-      { inputPath: temp.inputPath, outputPath: temp.outputPath },
+      {
+        inputPath: temp.inputPath,
+        outputPath: temp.outputPath,
+        timeoutMs: ghostscriptTimeoutMs,
+      },
+      ghostscriptTimeoutMs,
     );
 
     if (!compression.applied) {
@@ -170,11 +177,12 @@ export async function optimizeDrivePdfJob(
 async function compressPdfWithGhostscriptAndReportProgress(
   jobId: string,
   options: Parameters<typeof compressPdfWithGhostscript>[0],
+  ghostscriptTimeoutMs: number,
 ): Promise<Awaited<ReturnType<typeof compressPdfWithGhostscript>>> {
   const PROGRESS_START = 31;
   const PROGRESS_END = 75;
   const TICK_MS = 30_000;
-  const totalTicks = Math.floor(config.limits.ghostscriptTimeoutMs / TICK_MS);
+  const totalTicks = Math.floor(ghostscriptTimeoutMs / TICK_MS);
   const stepPerTick = totalTicks > 0 ? (PROGRESS_END - PROGRESS_START) / totalTicks : 0;
 
   let currentProgress = PROGRESS_START;

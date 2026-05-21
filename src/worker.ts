@@ -1,6 +1,11 @@
 import { Job, Worker } from "bullmq";
 
 import { config } from "./config";
+
+const workerLockDurationMs = Math.min(
+  config.limits.ghostscriptTimeoutMaxMs,
+  Math.max(120_000, config.limits.ghostscriptTimeoutMs),
+);
 import { optimizeDrivePdfJob } from "./jobs/optimizeDrivePdf";
 import {
   addFailedJobToDlq,
@@ -63,8 +68,7 @@ const worker = new Worker<DrivePdfOptimizeJob>(
     concurrency: config.workerConcurrency,
     // BullMQ renews the lock every lockDuration/2 automatically. The event
     // loop stays responsive because GS runs as a child process (non-blocking).
-    // 60 s is enough: if the worker crashes, stall detection kicks in quickly.
-    lockDuration: 60_000,
+    lockDuration: workerLockDurationMs,
   },
 );
 

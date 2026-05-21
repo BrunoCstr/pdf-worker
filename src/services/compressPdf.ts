@@ -18,11 +18,12 @@ export type CompressPdfResult = {
 export async function compressPdfWithGhostscript(options: {
   inputPath: string;
   outputPath: string;
+  timeoutMs?: number;
 }): Promise<CompressPdfResult> {
   const startedAt = performance.now();
   const originalStat = await stat(options.inputPath);
 
-  await runGhostscript(options.inputPath, options.outputPath);
+  await runGhostscript(options.inputPath, options.outputPath, options.timeoutMs);
 
   const compressedStat = await stat(options.outputPath);
   const reductionRatio = (originalStat.size - compressedStat.size) / originalStat.size;
@@ -39,7 +40,11 @@ export async function compressPdfWithGhostscript(options: {
   };
 }
 
-async function runGhostscript(inputPath: string, outputPath: string): Promise<void> {
+async function runGhostscript(
+  inputPath: string,
+  outputPath: string,
+  timeoutMs: number = config.limits.ghostscriptTimeoutMs,
+): Promise<void> {
   const args = [
     "-sDEVICE=pdfwrite",
     "-dCompatibilityLevel=1.7",
@@ -47,7 +52,10 @@ async function runGhostscript(inputPath: string, outputPath: string): Promise<vo
     "-dQUIET",
     "-dBATCH",
     "-dSAFER",
-    "-dDetectDuplicateImages=true",
+    ...(config.ghostscript.detectDuplicateImages ? ["-dDetectDuplicateImages=true"] : []),
+    ...(config.ghostscript.numRenderingThreads
+      ? [`-dNumRenderingThreads=${config.ghostscript.numRenderingThreads}`]
+      : []),
     "-dCompressFonts=true",
     "-dSubsetFonts=true",
     "-dDownsampleColorImages=true",
@@ -79,7 +87,7 @@ async function runGhostscript(inputPath: string, outputPath: string): Promise<vo
       // If GS ignores SIGTERM (e.g. blocked on disk I/O), force-kill after 5s
       // to guarantee the promise always settles and the worker is never frozen.
       killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-    }, config.limits.ghostscriptTimeoutMs);
+    }, timeoutMs);
 
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
@@ -100,7 +108,7 @@ async function runGhostscript(inputPath: string, outputPath: string): Promise<vo
       clearTimeout(killTimer);
 
       if (timedOut) {
-        reject(new Error(`Ghostscript timed out after ${config.limits.ghostscriptTimeoutMs}ms`));
+        reject(new Error(`Ghostscript timed out after ${timeoutMs}ms`));
         return;
       }
 

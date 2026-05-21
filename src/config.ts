@@ -17,8 +17,15 @@ export type AppConfig = {
   limits: {
     maxPdfBytes: number;
     minCompressionReduction: number;
+    /** Base Ghostscript timeout; scaled up for larger files via computeGhostscriptTimeoutMs. */
     ghostscriptTimeoutMs: number;
+    ghostscriptTimeoutPerMbMs: number;
+    ghostscriptTimeoutMaxMs: number;
     downloadTimeoutMs: number;
+  };
+  ghostscript: {
+    detectDuplicateImages: boolean;
+    numRenderingThreads?: number;
   };
   ghostscriptBinary: string;
   workerApiSecret?: string;
@@ -146,8 +153,34 @@ export const config: AppConfig = {
       max: 1,
     }),
     ghostscriptTimeoutMs: readNumber("DRIVE_PDF_OPTIMIZER_TIMEOUT_MS", 300_000, { min: 1 }),
+    ghostscriptTimeoutPerMbMs: readNumber("DRIVE_PDF_OPTIMIZER_TIMEOUT_PER_MB_MS", 45_000, {
+      min: 0,
+    }),
+    ghostscriptTimeoutMaxMs: readNumber("DRIVE_PDF_OPTIMIZER_TIMEOUT_MAX_MS", 900_000, {
+      min: 1,
+    }),
     downloadTimeoutMs: readNumber("DRIVE_DOWNLOAD_TIMEOUT_MS", 120_000, { min: 1 }),
+  },
+  ghostscript: {
+    detectDuplicateImages: readBoolean("GHOSTSCRIPT_DETECT_DUPLICATE_IMAGES", false),
+    numRenderingThreads: readOptional("GHOSTSCRIPT_NUM_RENDERING_THREADS")
+      ? readNumber("GHOSTSCRIPT_NUM_RENDERING_THREADS", 2, { min: 1, max: 32 })
+      : undefined,
   },
   ghostscriptBinary: readOptional("GHOSTSCRIPT_BINARY") ?? "gs",
   workerApiSecret: readOptional("WORKER_API_SECRET"),
 };
+
+const BYTES_PER_MB = 1024 * 1024;
+
+/** Larger PDFs get more wall-clock time before Ghostscript is killed. */
+export function computeGhostscriptTimeoutMs(fileSizeBytes: number): number {
+  const sizeMb = Math.max(1, Math.ceil(fileSizeBytes / BYTES_PER_MB));
+  const scaled =
+    config.limits.ghostscriptTimeoutMs + sizeMb * config.limits.ghostscriptTimeoutPerMbMs;
+
+  return Math.min(
+    Math.max(config.limits.ghostscriptTimeoutMs, scaled),
+    config.limits.ghostscriptTimeoutMaxMs,
+  );
+}

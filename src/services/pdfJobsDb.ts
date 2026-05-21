@@ -12,6 +12,7 @@ export async function markPdfJobDownloading(
     queue_wait_ms: options.queueWaitMs,
     attempt: options.attempt,
     progress: 5,
+    error_message: null,
   });
 }
 
@@ -56,7 +57,7 @@ export async function markPdfJobFailed(
   errorMessage: string,
   attempt: number,
 ): Promise<void> {
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("drive_pdf_jobs")
     .update({
       status: "failed",
@@ -65,10 +66,18 @@ export async function markPdfJobFailed(
       completed_at: new Date().toISOString(),
     })
     .eq("id", jobId)
-    .not("status", "in", '("completed","skipped")');
+    .neq("status", "completed")
+    .neq("status", "skipped")
+    .select("id");
 
   if (error) {
     throw new Error(`Failed to update drive_pdf_jobs row ${jobId}: ${error.message}`);
+  }
+
+  if (!data || data.length === 0) {
+    throw new Error(
+      `markPdfJobFailed: no rows updated for job ${jobId} — row may not exist or status is already terminal`,
+    );
   }
 }
 
@@ -79,6 +88,10 @@ export async function markPdfJobSkipped(jobId: string, compressionMessage: strin
     compression_message: compressionMessage,
     completed_at: new Date().toISOString(),
   });
+}
+
+export async function updatePdfJobProgress(jobId: string, progress: number): Promise<void> {
+  await supabase.from("drive_pdf_jobs").update({ progress }).eq("id", jobId);
 }
 
 async function updatePdfJob(jobId: string, patch: Record<string, unknown>): Promise<void> {

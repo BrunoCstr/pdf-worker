@@ -60,6 +60,10 @@ const worker = new Worker<DrivePdfOptimizeJob>(
   {
     connection: workerConnection,
     concurrency: config.workerConcurrency,
+    // Keep the lock alive well past the GS timeout so BullMQ never treats a
+    // long-running compression as a stalled job. Lock is auto-renewed every
+    // lockDuration/2, so the event loop just needs to stay responsive.
+    lockDuration: Math.max(config.limits.ghostscriptTimeoutMs * 2, 120_000),
   },
 );
 

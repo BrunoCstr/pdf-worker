@@ -16,6 +16,7 @@ import {
   markPdfJobCompressing,
   markPdfJobSkipped,
   markPdfJobUploading,
+  updatePdfJobProgress,
 } from "../services/pdfJobsDb";
 import { downloadStorageFile, uploadStorageFile } from "../services/storage";
 import { logger } from "../utils/logger";
@@ -76,10 +77,10 @@ export async function optimizeDrivePdfJob(
 
     await markPdfJobCompressingBestEffort(payload.jobId);
 
-    const compression = await compressPdfWithGhostscript({
-      inputPath: temp.inputPath,
-      outputPath: temp.outputPath,
-    });
+    const compression = await compressPdfWithGhostscriptAndReportProgress(
+      payload.jobId,
+      { inputPath: temp.inputPath, outputPath: temp.outputPath },
+    );
 
     if (!compression.applied) {
       await markFileReadyNotSmaller(payload.fileId);
@@ -158,6 +159,37 @@ export async function optimizeDrivePdfJob(
     return result;
   } finally {
     await temp.cleanup();
+  }
+}
+
+/**
+ * Runs Ghostscript compression while reporting DB progress every 30 s.
+ * Progress moves linearly from 31 → 75 over the GS timeout window so the
+ * client never sees the job frozen at 30% during a long compression run.
+ */
+async function compressPdfWithGhostscriptAndReportProgress(
+  jobId: string,
+  options: Parameters<typeof compressPdfWithGhostscript>[0],
+): Promise<Awaited<ReturnType<typeof compressPdfWithGhostscript>>> {
+  const PROGRESS_START = 31;
+  const PROGRESS_END = 75;
+  const TICK_MS = 30_000;
+  const totalTicks = Math.floor(config.limits.ghostscriptTimeoutMs / TICK_MS);
+  const stepPerTick = totalTicks > 0 ? (PROGRESS_END - PROGRESS_START) / totalTicks : 0;
+
+  let currentProgress = PROGRESS_START;
+  let tick = 0;
+
+  const timer = setInterval(() => {
+    tick += 1;
+    currentProgress = Math.min(PROGRESS_START + Math.round(stepPerTick * tick), PROGRESS_END);
+    updatePdfJobProgress(jobId, currentProgress).catch(() => {});
+  }, TICK_MS);
+
+  try {
+    return await compressPdfWithGhostscript(options);
+  } finally {
+    clearInterval(timer);
   }
 }
 

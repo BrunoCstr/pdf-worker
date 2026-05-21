@@ -71,9 +71,14 @@ async function runGhostscript(inputPath: string, outputPath: string): Promise<vo
 
     let stderr = "";
     let timedOut = false;
+    let killTimer: NodeJS.Timeout | undefined;
+
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
+      // If GS ignores SIGTERM (e.g. blocked on disk I/O), force-kill after 5s
+      // to guarantee the promise always settles and the worker is never frozen.
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
     }, config.limits.ghostscriptTimeoutMs);
 
     child.stderr.on("data", (chunk: Buffer) => {
@@ -86,11 +91,13 @@ async function runGhostscript(inputPath: string, outputPath: string): Promise<vo
 
     child.on("error", (error) => {
       clearTimeout(timeout);
+      clearTimeout(killTimer);
       reject(error);
     });
 
     child.on("close", (code, signal) => {
       clearTimeout(timeout);
+      clearTimeout(killTimer);
 
       if (timedOut) {
         reject(new Error(`Ghostscript timed out after ${config.limits.ghostscriptTimeoutMs}ms`));

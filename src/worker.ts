@@ -13,7 +13,7 @@ import {
   validateJobData,
   type DrivePdfOptimizeJob,
 } from "./queue";
-import { GHOSTSCRIPT_SETTING } from "./services/compressPdf";
+import { GHOSTSCRIPT_SETTING, smokeTestGhostscript } from "./services/compressPdf";
 import { insertCompressionAuditLog, markFileFailed } from "./services/filesDb";
 import { getPdfJob, markPdfJobDownloading, markPdfJobFailed } from "./services/pdfJobsDb";
 import { logger } from "./utils/logger";
@@ -25,93 +25,99 @@ const workerLockDurationMs = Math.min(
 
 const workerConnection = createRedisConnection();
 
-const worker = new Worker<DrivePdfOptimizeJob>(
-  config.queueName,
-  async (job) => {
-    validateJobData(job.data);
+let worker: Worker<DrivePdfOptimizeJob> | undefined;
 
-    const queueWaitMs = Math.max(0, Date.now() - Date.parse(job.data.enqueuedAt));
-    // job.attemptsMade inside the processor is 0-based (incremented only after
-    // the attempt fails). Add 1 to get a 1-based attempt number for storage.
-    const attempt = job.attemptsMade + 1;
+function createPdfOptimizeWorker(): Worker<DrivePdfOptimizeJob> {
+  const w = new Worker<DrivePdfOptimizeJob>(
+    config.queueName,
+    async (job) => {
+      validateJobData(job.data);
 
+      const queueWaitMs = Math.max(0, Date.now() - Date.parse(job.data.enqueuedAt));
+      // job.attemptsMade inside the processor is 0-based (incremented only after
+      // the attempt fails). Add 1 to get a 1-based attempt number for storage.
+      const attempt = job.attemptsMade + 1;
+
+      logger.info(
+        {
+          jobId: job.id,
+          jobDbId: job.data.jobId,
+          fileId: job.data.fileId,
+          userId: job.data.userId,
+          storagePath: job.data.storagePath,
+          queue_wait_ms: queueWaitMs,
+          attempt,
+        },
+        "Starting PDF optimization job",
+      );
+
+      if (await isPdfJobCancelled(job.data.jobId)) {
+        return buildCancelledResult(job.data, queueWaitMs);
+      }
+
+      await markPdfJobDownloading(job.data.jobId, { queueWaitMs, attempt });
+
+      try {
+        return await optimizeDrivePdfJob(job.data, queueWaitMs);
+      } catch (err) {
+        // Update DB on every failed attempt so the row never stays orphaned
+        // in a non-terminal state between retries. markPdfJobFailed guards
+        // against overwriting completed/skipped, so this is safe to call
+        // unconditionally. persistFinalFailure (called by the 'failed' event)
+        // will overwrite this on the last attempt with the same data.
+        const message = err instanceof Error ? err.message : "PDF optimization failed";
+
+        if (isJobCancelledError(err) || (await isPdfJobCancelled(job.data.jobId))) {
+          logger.info({ jobId: job.id, jobDbId: job.data.jobId }, "PDF optimization job cancelled");
+          return buildCancelledResult(job.data, queueWaitMs);
+        }
+
+        await markPdfJobFailed(job.data.jobId, message, attempt).catch((dbErr) =>
+          logger.error({ dbErr, jobDbId: job.data.jobId }, "Failed to mark pdf job as failed before retry"),
+        );
+        throw err;
+      }
+    },
+    {
+      connection: workerConnection,
+      concurrency: config.workerConcurrency,
+      // BullMQ renews the lock every lockDuration/2 automatically. The event
+      // loop stays responsive because GS runs as a child process (non-blocking).
+      lockDuration: workerLockDurationMs,
+    },
+  );
+
+  w.on("completed", (job, result) => {
     logger.info(
       {
         jobId: job.id,
         jobDbId: job.data.jobId,
         fileId: job.data.fileId,
-        userId: job.data.userId,
         storagePath: job.data.storagePath,
-        queue_wait_ms: queueWaitMs,
-        attempt,
+        queue_wait_ms: result.queueWaitMs,
+        download_ms: result.downloadMs,
+        ghostscript_ms: result.ghostscriptMs,
+        upload_ms: result.uploadMs,
+        duration_ms: result.durationMs,
+        applied: result.applied,
+        skipped: result.skipped,
+        original_size: result.originalSize,
+        compressed_size: result.compressedSize,
       },
-      "Starting PDF optimization job",
+      "Completed PDF optimization job",
     );
+  });
 
-    if (await isPdfJobCancelled(job.data.jobId)) {
-      return buildCancelledResult(job.data, queueWaitMs);
-    }
+  w.on("failed", (job, error) => {
+    void handleFailedJob(job, error);
+  });
 
-    await markPdfJobDownloading(job.data.jobId, { queueWaitMs, attempt });
+  w.on("error", (error) => {
+    logger.error({ error }, "Worker error");
+  });
 
-    try {
-      return await optimizeDrivePdfJob(job.data, queueWaitMs);
-    } catch (err) {
-      // Update DB on every failed attempt so the row never stays orphaned
-      // in a non-terminal state between retries. markPdfJobFailed guards
-      // against overwriting completed/skipped, so this is safe to call
-      // unconditionally. persistFinalFailure (called by the 'failed' event)
-      // will overwrite this on the last attempt with the same data.
-      const message = err instanceof Error ? err.message : "PDF optimization failed";
-
-      if (isJobCancelledError(err) || (await isPdfJobCancelled(job.data.jobId))) {
-        logger.info({ jobId: job.id, jobDbId: job.data.jobId }, "PDF optimization job cancelled");
-        return buildCancelledResult(job.data, queueWaitMs);
-      }
-
-      await markPdfJobFailed(job.data.jobId, message, attempt).catch((dbErr) =>
-        logger.error({ dbErr, jobDbId: job.data.jobId }, "Failed to mark pdf job as failed before retry"),
-      );
-      throw err;
-    }
-  },
-  {
-    connection: workerConnection,
-    concurrency: config.workerConcurrency,
-    // BullMQ renews the lock every lockDuration/2 automatically. The event
-    // loop stays responsive because GS runs as a child process (non-blocking).
-    lockDuration: workerLockDurationMs,
-  },
-);
-
-worker.on("completed", (job, result) => {
-  logger.info(
-    {
-      jobId: job.id,
-      jobDbId: job.data.jobId,
-      fileId: job.data.fileId,
-      storagePath: job.data.storagePath,
-      queue_wait_ms: result.queueWaitMs,
-      download_ms: result.downloadMs,
-      ghostscript_ms: result.ghostscriptMs,
-      upload_ms: result.uploadMs,
-      duration_ms: result.durationMs,
-      applied: result.applied,
-      skipped: result.skipped,
-      original_size: result.originalSize,
-      compressed_size: result.compressedSize,
-    },
-    "Completed PDF optimization job",
-  );
-});
-
-worker.on("failed", (job, error) => {
-  void handleFailedJob(job, error);
-});
-
-worker.on("error", (error) => {
-  logger.error({ error }, "Worker error");
-});
+  return w;
+}
 
 async function handleFailedJob(job: Job<DrivePdfOptimizeJob> | undefined, error: Error): Promise<void> {
   if (!job) {
@@ -231,7 +237,9 @@ function buildCancelledResult(job: DrivePdfOptimizeJob, queueWaitMs: number) {
 async function shutdown(signal: NodeJS.Signals): Promise<void> {
   logger.info({ signal }, "Shutting down PDF worker");
 
-  await worker.close();
+  if (worker) {
+    await worker.close();
+  }
   await pdfOptimizeQueue.close();
   await deadLetterQueue.close();
   await workerConnection.quit();
@@ -249,13 +257,46 @@ process.on("SIGINT", () => {
   void shutdown("SIGINT").then(() => process.exit(0));
 });
 
-logger.info(
-  {
-    queueName: config.queueName,
-    dlqName: config.dlqName,
-    concurrency: config.workerConcurrency,
-    bucket: config.supabase.bucket,
-    maxPdfBytes: config.limits.maxPdfBytes,
-  },
-  "PDF worker started",
-);
+async function bootstrap(): Promise<void> {
+  // Validate Ghostscript argv against a synthetic PDF before accepting jobs.
+  // Catches malformed flags (e.g. wrong -s vs -d prefix, deprecated params on
+  // older GS versions, missing binary) at boot time so misconfiguration never
+  // hits a real user job.
+  try {
+    const smoke = await smokeTestGhostscript();
+    logger.info(
+      {
+        duration_ms: smoke.durationMs,
+        input_bytes: smoke.inputBytes,
+        output_bytes: smoke.outputBytes,
+        gs_binary: config.ghostscriptBinary,
+      },
+      "Ghostscript smoke test passed",
+    );
+  } catch (err) {
+    logger.fatal(
+      {
+        err,
+        gs_binary: config.ghostscriptBinary,
+        gs_config: config.ghostscript,
+      },
+      "Ghostscript smoke test failed — refusing to start worker. Fix the configuration and redeploy.",
+    );
+    process.exit(1);
+  }
+
+  worker = createPdfOptimizeWorker();
+
+  logger.info(
+    {
+      queueName: config.queueName,
+      dlqName: config.dlqName,
+      concurrency: config.workerConcurrency,
+      bucket: config.supabase.bucket,
+      maxPdfBytes: config.limits.maxPdfBytes,
+    },
+    "PDF worker started",
+  );
+}
+
+void bootstrap();

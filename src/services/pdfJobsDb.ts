@@ -1,3 +1,4 @@
+import { logger } from "../utils/logger";
 import { supabase } from "./supabase";
 
 export type PdfJobStatus = "queued" | "downloading" | "compressing" | "uploading" | "completed" | "failed" | "skipped";
@@ -71,12 +72,25 @@ export async function markPdfJobFailed(
     .select("id");
 
   if (error) {
+    logger.error({ err: error, jobId }, "markPdfJobFailed: supabase error");
     throw new Error(`Failed to update drive_pdf_jobs row ${jobId}: ${error.message}`);
   }
 
   if (!data || data.length === 0) {
+    // Query the current status to explain WHY no rows were affected.
+    const { data: current } = await supabase
+      .from("drive_pdf_jobs")
+      .select("status, attempt")
+      .eq("id", jobId)
+      .maybeSingle();
+
+    logger.error(
+      { jobId, currentStatus: current?.status ?? "row_not_found", currentAttempt: current?.attempt },
+      "markPdfJobFailed: 0 rows updated — row missing or status is already terminal",
+    );
+
     throw new Error(
-      `markPdfJobFailed: no rows updated for job ${jobId} — row may not exist or status is already terminal`,
+      `markPdfJobFailed: no rows updated for job ${jobId} — status=${current?.status ?? "not_found"}`,
     );
   }
 }

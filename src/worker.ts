@@ -6,6 +6,7 @@ import {
   addFailedJobToDlq,
   createRedisConnection,
   deadLetterQueue,
+  dlqConnection,
   pdfOptimizeQueue,
   redisConnection,
   validateJobData,
@@ -191,6 +192,7 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   await deadLetterQueue.close();
   await workerConnection.quit();
   await redisConnection.quit();
+  await dlqConnection.quit();
 
   logger.info("PDF worker stopped");
 }

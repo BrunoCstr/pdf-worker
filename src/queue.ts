@@ -29,13 +29,15 @@ export type FailedDrivePdfJob = {
 export { createRedisConnection } from "./redis";
 
 export const redisConnection = createRedisConnection();
+// DLQ uses its own connection — BullMQ queues should not share connections.
+export const dlqConnection = createRedisConnection();
 
 export const pdfOptimizeQueue = new Queue<DrivePdfOptimizeJob>(config.queueName, {
   connection: redisConnection,
 });
 
 export const deadLetterQueue = new Queue<FailedDrivePdfJob>(config.dlqName, {
-  connection: redisConnection,
+  connection: dlqConnection,
 });
 
 export function validateJobData(data: unknown): asserts data is DrivePdfOptimizeJob {

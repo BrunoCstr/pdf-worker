@@ -16,6 +16,7 @@ export type AppConfig = {
   };
   limits: {
     maxPdfBytes: number;
+    maxPdfPages: number;
     minCompressionReduction: number;
     /** Base Ghostscript timeout; scaled up for larger files via computeGhostscriptTimeoutMs. */
     ghostscriptTimeoutMs: number;
@@ -97,6 +98,16 @@ function readNumber(name: string, fallback: number, options?: { min?: number; ma
 
   if (options?.max !== undefined && value > options.max) {
     throw new Error(`Environment variable ${name} must be <= ${options.max}`);
+  }
+
+  return value;
+}
+
+function readInteger(name: string, fallback: number, options?: { min?: number; max?: number }): number {
+  const value = readNumber(name, fallback, options);
+
+  if (!Number.isInteger(value)) {
+    throw new Error(`Environment variable ${name} must be an integer`);
   }
 
   return value;
@@ -231,6 +242,7 @@ export const config: AppConfig = {
   },
   limits: {
     maxPdfBytes: readNumber("DRIVE_PDF_COMPRESS_MAX_BYTES", 524_288_000, { min: 1 }),
+    maxPdfPages: readInteger("DRIVE_PDF_COMPRESS_MAX_PAGES", 500, { min: 1 }),
     minCompressionReduction: readNumber("DRIVE_MIN_COMPRESSION_REDUCTION", 0.05, {
       min: 0,
       max: 1,

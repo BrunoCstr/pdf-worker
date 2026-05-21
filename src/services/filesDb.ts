@@ -15,6 +15,8 @@ export type CompressionAuditMetadata = {
   upload_ms?: number;
   message?: string;
   error?: string;
+  page_count?: number;
+  max_page_count?: number;
 };
 
 export async function markFileProcessing(fileId: string): Promise<void> {

@@ -40,7 +40,13 @@ export type OptimizeDrivePdfResult = {
   downloadMs?: number;
   ghostscriptMs?: number;
   uploadMs?: number;
+  pageCount?: number;
+  maxPageCount?: number;
 };
+
+function buildTooManyPagesMessage(maxPages: number): string {
+  return `PDF com mais de ${maxPages} páginas, otimização automática não disponível.`;
+}
 
 export async function optimizeDrivePdfJob(
   payload: DrivePdfOptimizeJob,
@@ -49,6 +55,30 @@ export async function optimizeDrivePdfJob(
   const startedAt = performance.now();
 
   await assertPdfJobNotCancelled(payload.jobId);
+
+  if (payload.pageCount !== undefined && payload.pageCount > config.limits.maxPdfPages) {
+    const durationMs = Math.round(performance.now() - startedAt);
+    const message = buildTooManyPagesMessage(config.limits.maxPdfPages);
+
+    await markFileSkipped(payload.fileId, message);
+    await markPdfJobSkippedBestEffort(payload.jobId, message);
+
+    const result: OptimizeDrivePdfResult = {
+      applied: false,
+      skipped: true,
+      message,
+      originalSize: payload.originalSizeBytes,
+      compressedSize: payload.originalSizeBytes,
+      reductionRatio: 0,
+      queueWaitMs,
+      durationMs,
+      pageCount: payload.pageCount,
+      maxPageCount: config.limits.maxPdfPages,
+    };
+
+    await insertAuditLogBestEffort(payload, result);
+    return result;
+  }
 
   if (payload.originalSizeBytes > config.limits.maxPdfBytes) {
     const message = `pdf_too_large:${payload.originalSizeBytes}>${config.limits.maxPdfBytes}`;
@@ -371,6 +401,8 @@ async function insertAuditLogBestEffort(
         ghostscript_ms: result.ghostscriptMs,
         upload_ms: result.uploadMs,
         message: result.message,
+        page_count: result.pageCount ?? payload.pageCount,
+        max_page_count: result.maxPageCount,
       },
     });
   } catch (error) {

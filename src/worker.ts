@@ -103,6 +103,8 @@ function createPdfOptimizeWorker(): Worker<DrivePdfOptimizeJob> {
         skipped: result.skipped,
         original_size: result.originalSize,
         compressed_size: result.compressedSize,
+        page_count: result.pageCount,
+        max_page_count: result.maxPageCount,
       },
       "Completed PDF optimization job",
     );

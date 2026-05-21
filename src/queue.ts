@@ -12,6 +12,7 @@ export type DrivePdfOptimizeJob = {
   storagePath: string;
   mimeType: "application/pdf";
   originalSizeBytes: number;
+  pageCount?: number;
   bucket: string;
   enqueuedAt: string;
   signature?: string;
@@ -77,6 +78,15 @@ export function validateJobData(data: unknown): asserts data is DrivePdfOptimize
     payload.originalSizeBytes <= 0
   ) {
     throw new Error("originalSizeBytes must be a positive number");
+  }
+
+  if (
+    payload.pageCount !== undefined &&
+    (typeof payload.pageCount !== "number" ||
+      !Number.isInteger(payload.pageCount) ||
+      payload.pageCount <= 0)
+  ) {
+    throw new Error("pageCount must be a positive integer when provided");
   }
 
   if (!payload.bucket || typeof payload.bucket !== "string") {

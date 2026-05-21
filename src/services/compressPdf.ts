@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 import { config } from "../config";
 import { JobCancelledError } from "../errors";
 
-export const GHOSTSCRIPT_SETTING = "ghostscript-300dpi";
+export const GHOSTSCRIPT_SETTING = "ghostscript-study";
 
 export type CompressPdfResult = {
   originalSize: number;
@@ -16,16 +16,30 @@ export type CompressPdfResult = {
   ghostscriptMs: number;
 };
 
+export type GhostscriptProgress = {
+  /** 1-based page index Ghostscript is currently writing. */
+  currentPage: number;
+  /** Total page count parsed from "Processing pages 1 through N.". Null until the line is seen. */
+  totalPages: number | null;
+};
+
 export async function compressPdfWithGhostscript(options: {
   inputPath: string;
   outputPath: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  onProgress?: (progress: GhostscriptProgress) => void;
 }): Promise<CompressPdfResult> {
   const startedAt = performance.now();
   const originalStat = await stat(options.inputPath);
 
-  await runGhostscript(options.inputPath, options.outputPath, options.timeoutMs, options.signal);
+  await runGhostscript(
+    options.inputPath,
+    options.outputPath,
+    options.timeoutMs,
+    options.signal,
+    options.onProgress,
+  );
 
   const compressedStat = await stat(options.outputPath);
   const reductionRatio = (originalStat.size - compressedStat.size) / originalStat.size;
@@ -42,35 +56,51 @@ export async function compressPdfWithGhostscript(options: {
   };
 }
 
+const PROCESSING_PAGES_RE = /Processing pages \d+ through (\d+)\./;
+const PAGE_RE = /Page (\d+)/g;
+
 async function runGhostscript(
   inputPath: string,
   outputPath: string,
   timeoutMs: number = config.limits.ghostscriptTimeoutMs,
   signal?: AbortSignal,
+  onProgress?: (progress: GhostscriptProgress) => void,
 ): Promise<void> {
   const args = [
     "-sDEVICE=pdfwrite",
     "-dCompatibilityLevel=1.7",
     "-dNOPAUSE",
-    "-dQUIET",
     "-dBATCH",
     "-dSAFER",
+    // Redirect Ghostscript's stdout (where "Page N" lines normally go) to stderr
+    // so we have a single stream to parse for progress AND for error context.
+    "-sstdout=%stderr",
     ...(config.ghostscript.detectDuplicateImages ? ["-dDetectDuplicateImages=true"] : []),
     ...(config.ghostscript.numRenderingThreads
       ? [`-dNumRenderingThreads=${config.ghostscript.numRenderingThreads}`]
       : []),
     "-dCompressFonts=true",
     "-dSubsetFonts=true",
+    // Auto filtering: GS chooses JPEG (DCT) for photographic content and
+    // Flate (lossless ZIP-like) for diagrams/line-art. Critical for medical
+    // study material where charts and illustrations must stay lossless.
+    `-dAutoFilterColorImages=${config.ghostscript.autoFilterColorImages}`,
+    `-dAutoFilterGrayImages=${config.ghostscript.autoFilterGrayImages}`,
     "-dDownsampleColorImages=true",
     "-dDownsampleGrayImages=true",
     "-dDownsampleMonoImages=true",
-    "-dColorImageDownsampleType=/Bicubic",
-    "-dGrayImageDownsampleType=/Bicubic",
-    "-dMonoImageDownsampleType=/Subsample",
-    "-dColorImageResolution=300",
-    "-dGrayImageResolution=300",
-    "-dMonoImageResolution=300",
-    "-dJPEGQ=92",
+    `-dColorImageDownsampleType=/${config.ghostscript.colorImageDownsampleType}`,
+    `-dGrayImageDownsampleType=/${config.ghostscript.grayImageDownsampleType}`,
+    `-dMonoImageDownsampleType=/${config.ghostscript.monoImageDownsampleType}`,
+    `-dColorImageResolution=${config.ghostscript.colorImageResolution}`,
+    `-dGrayImageResolution=${config.ghostscript.grayImageResolution}`,
+    `-dMonoImageResolution=${config.ghostscript.monoImageResolution}`,
+    `-dJPEGQ=${config.ghostscript.jpegQuality}`,
+    // Preserve original color space — important for ECG colors, MRI heatmaps,
+    // histology stains, and any color-coded diagrams.
+    `-sColorConversionStrategy=/${config.ghostscript.colorConversionStrategy}`,
+    // Keep annotations (highlights, sticky notes) that students may have added.
+    `-dPreserveAnnots=${config.ghostscript.preserveAnnots}`,
     `-sOutputFile=${outputPath}`,
     inputPath,
   ];
@@ -80,7 +110,10 @@ async function runGhostscript(
       stdio: ["ignore", "ignore", "pipe"],
     });
 
-    let stderr = "";
+    let stderrTail = "";
+    let stderrBuffer = "";
+    let totalPages: number | null = null;
+    let currentPage = 0;
     let timedOut = false;
     let settled = false;
     let keepKillTimer = false;
@@ -129,10 +162,55 @@ async function runGhostscript(
     signal?.addEventListener("abort", abortGhostscript, { once: true });
 
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
 
-      if (stderr.length > 8_192) {
-        stderr = stderr.slice(-8_192);
+      stderrTail += text;
+      if (stderrTail.length > 8_192) {
+        stderrTail = stderrTail.slice(-8_192);
+      }
+
+      if (!onProgress) {
+        return;
+      }
+
+      stderrBuffer += text;
+
+      // Cap the parse buffer to prevent unbounded growth on long runs.
+      if (stderrBuffer.length > 16_384) {
+        stderrBuffer = stderrBuffer.slice(-16_384);
+      }
+
+      let progressChanged = false;
+
+      if (totalPages === null) {
+        const match = PROCESSING_PAGES_RE.exec(stderrBuffer);
+        if (match) {
+          totalPages = Number.parseInt(match[1] ?? "", 10) || null;
+          progressChanged = totalPages !== null;
+        }
+      }
+
+      PAGE_RE.lastIndex = 0;
+      let pageMatch: RegExpExecArray | null;
+      let lastPage = currentPage;
+      while ((pageMatch = PAGE_RE.exec(stderrBuffer)) !== null) {
+        const pageNum = Number.parseInt(pageMatch[1] ?? "", 10);
+        if (Number.isFinite(pageNum) && pageNum > lastPage) {
+          lastPage = pageNum;
+        }
+      }
+
+      if (lastPage > currentPage) {
+        currentPage = lastPage;
+        progressChanged = true;
+      }
+
+      if (progressChanged) {
+        try {
+          onProgress({ currentPage, totalPages });
+        } catch {
+          // Progress callbacks must never crash the GS pipeline.
+        }
       }
     });
 
@@ -140,7 +218,7 @@ async function runGhostscript(
       rejectOnce(error);
     });
 
-    child.on("close", (code, signal) => {
+    child.on("close", (code, sig) => {
       if (settled) {
         return;
       }
@@ -160,7 +238,7 @@ async function runGhostscript(
 
       reject(
         new Error(
-          `Ghostscript failed with code ${code ?? "unknown"} and signal ${signal ?? "none"}: ${stderr.trim()}`,
+          `Ghostscript failed with code ${code ?? "unknown"} and signal ${sig ?? "none"}: ${stderrTail.trim()}`,
         ),
       );
     });

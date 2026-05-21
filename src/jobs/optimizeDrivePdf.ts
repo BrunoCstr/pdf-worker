@@ -3,7 +3,11 @@ import { performance } from "node:perf_hooks";
 import { computeGhostscriptTimeoutMs, config } from "../config";
 import { JobCancelledError } from "../errors";
 import type { DrivePdfOptimizeJob } from "../queue";
-import { compressPdfWithGhostscript } from "../services/compressPdf";
+import {
+  compressPdfWithGhostscript,
+  GHOSTSCRIPT_SETTING,
+  type GhostscriptProgress,
+} from "../services/compressPdf";
 import {
   adjustUserStorageUsedBytes,
   insertCompressionAuditLog,
@@ -182,57 +186,125 @@ export async function optimizeDrivePdfJob(
 }
 
 /**
- * Runs Ghostscript compression while reporting DB progress every 30 s.
- * Progress moves linearly from 31 → 75 over the GS timeout window so the
- * client never sees the job frozen at 30% during a long compression run.
+ * Runs Ghostscript and reports REAL progress by parsing GS stderr output.
+ *
+ * Progress strategy:
+ * - `compressPdf` invokes `onProgress` every time GS emits a new page or
+ *   when the total page count is first parsed ("Processing pages 1 through N.").
+ * - We map (currentPage / totalPages) linearly into the [31, 75] window so the
+ *   user-visible progress reflects actual work done, not elapsed time.
+ * - DB writes are throttled (min interval + min delta) to avoid hammering
+ *   Supabase on PDFs with hundreds of small pages.
+ *
+ * Fallback:
+ * - If GS never emits "Processing pages ..." (rare, e.g. for some malformed
+ *   PDFs), we tick a slow time-based progress from 31 → 60 so the bar still
+ *   moves. As soon as a real Page line is parsed, real progress takes over.
+ *
+ * Cancellation:
+ * - An independent low-frequency timer checks if the job was cancelled and
+ *   aborts the GS process via AbortController.
  */
 async function compressPdfWithGhostscriptAndReportProgress(
   jobId: string,
-  options: Parameters<typeof compressPdfWithGhostscript>[0],
+  options: Omit<Parameters<typeof compressPdfWithGhostscript>[0], "signal" | "onProgress">,
   ghostscriptTimeoutMs: number,
 ): Promise<Awaited<ReturnType<typeof compressPdfWithGhostscript>>> {
   const PROGRESS_START = 31;
   const PROGRESS_END = 75;
-  const TICK_MS = 30_000;
-  const totalTicks = Math.floor(ghostscriptTimeoutMs / TICK_MS);
-  const stepPerTick = totalTicks > 0 ? (PROGRESS_END - PROGRESS_START) / totalTicks : 0;
+  const FALLBACK_PROGRESS_CEILING = 60;
+  const MIN_DB_INTERVAL_MS = 1_500;
+  const MIN_DB_DELTA = 1;
+  const CANCEL_CHECK_INTERVAL_MS = 5_000;
 
-  let currentProgress = PROGRESS_START;
-  let tick = 0;
-  let checkingCancellation = false;
   const abortController = new AbortController();
+  const startedAt = performance.now();
 
-  const timer = setInterval(() => {
-    if (checkingCancellation) {
+  let lastReportedProgress = PROGRESS_START;
+  let lastDbWriteAt = 0;
+  let realProgressSeen = false;
+  let pendingWrite: Promise<void> | null = null;
+
+  const reportProgress = (progress: number) => {
+    const clamped = Math.max(PROGRESS_START, Math.min(PROGRESS_END, Math.round(progress)));
+    const now = Date.now();
+    const delta = clamped - lastReportedProgress;
+
+    if (delta < MIN_DB_DELTA || now - lastDbWriteAt < MIN_DB_INTERVAL_MS) {
       return;
     }
 
-    checkingCancellation = true;
-    tick += 1;
-    currentProgress = Math.min(PROGRESS_START + Math.round(stepPerTick * tick), PROGRESS_END);
+    lastReportedProgress = clamped;
+    lastDbWriteAt = now;
 
+    if (pendingWrite) {
+      return;
+    }
+
+    pendingWrite = (async () => {
+      try {
+        await updatePdfJobProgress(jobId, clamped);
+      } catch (error) {
+        logger.warn({ error, jobId, progress: clamped }, "Failed to update pdf job progress");
+      } finally {
+        pendingWrite = null;
+      }
+    })();
+  };
+
+  const onProgress = (info: GhostscriptProgress) => {
+    if (!info.totalPages || info.totalPages <= 0) {
+      return;
+    }
+
+    realProgressSeen = true;
+    const ratio = Math.min(1, info.currentPage / info.totalPages);
+    reportProgress(PROGRESS_START + ratio * (PROGRESS_END - PROGRESS_START));
+  };
+
+  const fallbackTimer = setInterval(() => {
+    if (realProgressSeen) {
+      return;
+    }
+
+    // Without a totalPages signal, advance slowly toward FALLBACK_PROGRESS_CEILING
+    // proportional to elapsed time vs configured timeout. Real progress will
+    // overwrite this the moment GS emits its first "Page N" line.
+    const elapsed = performance.now() - startedAt;
+    const ratio = Math.min(1, elapsed / ghostscriptTimeoutMs);
+    const projected = PROGRESS_START + ratio * (FALLBACK_PROGRESS_CEILING - PROGRESS_START);
+    reportProgress(projected);
+  }, MIN_DB_INTERVAL_MS);
+
+  const cancelTimer = setInterval(() => {
     void (async () => {
       try {
         await assertPdfJobNotCancelled(jobId);
-        await updatePdfJobProgress(jobId, currentProgress);
       } catch (error) {
         if (error instanceof JobCancelledError) {
           abortController.abort(error);
-          return;
         }
-
-        logger.warn({ error, jobId }, "Failed to update pdf job progress");
-      } finally {
-        checkingCancellation = false;
       }
     })();
-  }, TICK_MS);
+  }, CANCEL_CHECK_INTERVAL_MS);
 
   try {
     await assertPdfJobNotCancelled(jobId);
-    return await compressPdfWithGhostscript({ ...options, signal: abortController.signal });
+    return await compressPdfWithGhostscript({
+      ...options,
+      signal: abortController.signal,
+      onProgress,
+    });
   } finally {
-    clearInterval(timer);
+    clearInterval(fallbackTimer);
+    clearInterval(cancelTimer);
+
+    // The IIFE inside reportProgress already catches its own errors, so we
+    // just need to wait for any in-flight DB write to finish before resolving.
+    const inFlight: Promise<void> | null = pendingWrite;
+    if (inFlight !== null) {
+      await inFlight;
+    }
   }
 }
 
@@ -289,7 +361,7 @@ async function insertAuditLogBestEffort(
       userId: payload.userId,
       metadata: {
         applied: result.applied,
-        setting: "ghostscript-300dpi",
+        setting: GHOSTSCRIPT_SETTING,
         original_size: result.originalSize,
         compressed_size: result.compressedSize,
         reduction_ratio: result.reductionRatio,

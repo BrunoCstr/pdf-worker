@@ -13,6 +13,7 @@ import {
   validateJobData,
   type DrivePdfOptimizeJob,
 } from "./queue";
+import { GHOSTSCRIPT_SETTING } from "./services/compressPdf";
 import { insertCompressionAuditLog, markFileFailed } from "./services/filesDb";
 import { getPdfJob, markPdfJobDownloading, markPdfJobFailed } from "./services/pdfJobsDb";
 import { logger } from "./utils/logger";
@@ -180,7 +181,7 @@ async function persistFinalFailure(job: Job<DrivePdfOptimizeJob>, error: Error):
       userId: job.data.userId,
       metadata: {
         applied: false,
-        setting: "ghostscript-300dpi",
+        setting: GHOSTSCRIPT_SETTING,
         original_size: job.data.originalSizeBytes,
         compressed_size: job.data.originalSizeBytes,
         reduction_ratio: 0,

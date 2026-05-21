@@ -26,10 +26,47 @@ export type AppConfig = {
   ghostscript: {
     detectDuplicateImages: boolean;
     numRenderingThreads?: number;
+    colorImageResolution: number;
+    grayImageResolution: number;
+    monoImageResolution: number;
+    colorImageDownsampleType: GhostscriptDownsampleType;
+    grayImageDownsampleType: GhostscriptDownsampleType;
+    monoImageDownsampleType: GhostscriptDownsampleType;
+    jpegQuality: number;
+    /** Let Ghostscript pick JPEG for photos and Flate (lossless) for diagrams. */
+    autoFilterColorImages: boolean;
+    autoFilterGrayImages: boolean;
+    /** "LeaveColorUnchanged" preserves diagram colors (ECG, MRI, histology stains). */
+    colorConversionStrategy: GhostscriptColorConversionStrategy;
+    /** Keep annotations (student highlights/notes). */
+    preserveAnnots: boolean;
   };
   ghostscriptBinary: string;
   workerApiSecret?: string;
 };
+
+export type GhostscriptDownsampleType = "Bicubic" | "Average" | "Subsample";
+
+const GHOSTSCRIPT_DOWNSAMPLE_TYPES: readonly GhostscriptDownsampleType[] = [
+  "Bicubic",
+  "Average",
+  "Subsample",
+];
+
+export type GhostscriptColorConversionStrategy =
+  | "LeaveColorUnchanged"
+  | "RGB"
+  | "CMYK"
+  | "Gray"
+  | "UseDeviceIndependentColor";
+
+const GHOSTSCRIPT_COLOR_CONVERSION_STRATEGIES: readonly GhostscriptColorConversionStrategy[] = [
+  "LeaveColorUnchanged",
+  "RGB",
+  "CMYK",
+  "Gray",
+  "UseDeviceIndependentColor",
+];
 
 function readRequired(name: string): string {
   const value = process.env[name];
@@ -63,6 +100,52 @@ function readNumber(name: string, fallback: number, options?: { min?: number; ma
   }
 
   return value;
+}
+
+function readDownsampleType(
+  name: string,
+  fallback: GhostscriptDownsampleType,
+): GhostscriptDownsampleType {
+  const raw = readOptional(name);
+
+  if (raw === undefined) {
+    return fallback;
+  }
+
+  const match = GHOSTSCRIPT_DOWNSAMPLE_TYPES.find(
+    (type) => type.toLowerCase() === raw.toLowerCase(),
+  );
+
+  if (!match) {
+    throw new Error(
+      `Environment variable ${name} must be one of: ${GHOSTSCRIPT_DOWNSAMPLE_TYPES.join(", ")}`,
+    );
+  }
+
+  return match;
+}
+
+function readColorConversionStrategy(
+  name: string,
+  fallback: GhostscriptColorConversionStrategy,
+): GhostscriptColorConversionStrategy {
+  const raw = readOptional(name);
+
+  if (raw === undefined) {
+    return fallback;
+  }
+
+  const match = GHOSTSCRIPT_COLOR_CONVERSION_STRATEGIES.find(
+    (strategy) => strategy.toLowerCase() === raw.toLowerCase(),
+  );
+
+  if (!match) {
+    throw new Error(
+      `Environment variable ${name} must be one of: ${GHOSTSCRIPT_COLOR_CONVERSION_STRATEGIES.join(", ")}`,
+    );
+  }
+
+  return match;
 }
 
 function readBoolean(name: string, fallback: boolean): boolean {
@@ -162,10 +245,33 @@ export const config: AppConfig = {
     downloadTimeoutMs: readNumber("DRIVE_DOWNLOAD_TIMEOUT_MS", 120_000, { min: 1 }),
   },
   ghostscript: {
-    detectDuplicateImages: readBoolean("GHOSTSCRIPT_DETECT_DUPLICATE_IMAGES", false),
+    detectDuplicateImages: readBoolean("GHOSTSCRIPT_DETECT_DUPLICATE_IMAGES", true),
     numRenderingThreads: readOptional("GHOSTSCRIPT_NUM_RENDERING_THREADS")
       ? readNumber("GHOSTSCRIPT_NUM_RENDERING_THREADS", 2, { min: 1, max: 32 })
       : undefined,
+    colorImageResolution: readNumber("GHOSTSCRIPT_COLOR_IMAGE_RESOLUTION", 200, {
+      min: 36,
+      max: 1200,
+    }),
+    grayImageResolution: readNumber("GHOSTSCRIPT_GRAY_IMAGE_RESOLUTION", 200, {
+      min: 36,
+      max: 1200,
+    }),
+    monoImageResolution: readNumber("GHOSTSCRIPT_MONO_IMAGE_RESOLUTION", 300, {
+      min: 36,
+      max: 1200,
+    }),
+    colorImageDownsampleType: readDownsampleType("GHOSTSCRIPT_COLOR_DOWNSAMPLE_TYPE", "Bicubic"),
+    grayImageDownsampleType: readDownsampleType("GHOSTSCRIPT_GRAY_DOWNSAMPLE_TYPE", "Bicubic"),
+    monoImageDownsampleType: readDownsampleType("GHOSTSCRIPT_MONO_DOWNSAMPLE_TYPE", "Subsample"),
+    jpegQuality: readNumber("GHOSTSCRIPT_JPEG_QUALITY", 90, { min: 1, max: 100 }),
+    autoFilterColorImages: readBoolean("GHOSTSCRIPT_AUTO_FILTER_COLOR_IMAGES", true),
+    autoFilterGrayImages: readBoolean("GHOSTSCRIPT_AUTO_FILTER_GRAY_IMAGES", true),
+    colorConversionStrategy: readColorConversionStrategy(
+      "GHOSTSCRIPT_COLOR_CONVERSION_STRATEGY",
+      "LeaveColorUnchanged",
+    ),
+    preserveAnnots: readBoolean("GHOSTSCRIPT_PRESERVE_ANNOTS", true),
   },
   ghostscriptBinary: readOptional("GHOSTSCRIPT_BINARY") ?? "gs",
   workerApiSecret: readOptional("WORKER_API_SECRET"),

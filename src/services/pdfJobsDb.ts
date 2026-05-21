@@ -56,12 +56,20 @@ export async function markPdfJobFailed(
   errorMessage: string,
   attempt: number,
 ): Promise<void> {
-  await updatePdfJob(jobId, {
-    status: "failed",
-    error_message: errorMessage,
-    attempt,
-    completed_at: new Date().toISOString(),
-  });
+  const { error } = await supabase
+    .from("drive_pdf_jobs")
+    .update({
+      status: "failed",
+      error_message: errorMessage,
+      attempt,
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", jobId)
+    .not("status", "in", '("completed","skipped")');
+
+  if (error) {
+    throw new Error(`Failed to update drive_pdf_jobs row ${jobId}: ${error.message}`);
+  }
 }
 
 export async function markPdfJobSkipped(jobId: string, compressionMessage: string): Promise<void> {

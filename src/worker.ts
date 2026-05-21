@@ -23,9 +23,9 @@ const worker = new Worker<DrivePdfOptimizeJob>(
     validateJobData(job.data);
 
     const queueWaitMs = Math.max(0, Date.now() - Date.parse(job.data.enqueuedAt));
-    // BullMQ increments attemptsMade before the processor runs, so attemptsMade
-    // already reflects the current attempt number (1-based).
-    const attempt = job.attemptsMade;
+    // job.attemptsMade inside the processor is 0-based (incremented only after
+    // the attempt fails). Add 1 to get a 1-based attempt number for storage.
+    const attempt = job.attemptsMade + 1;
 
     logger.info(
       {
@@ -42,26 +42,19 @@ const worker = new Worker<DrivePdfOptimizeJob>(
 
     await markPdfJobDownloading(job.data.jobId, { queueWaitMs, attempt });
 
-    let terminalReached = false;
     try {
-      const result = await optimizeDrivePdfJob(job.data, queueWaitMs);
-      terminalReached = true;
-      return result;
-    } finally {
-      if (!terminalReached) {
-        const maxAttempts = job.opts.attempts ?? 1;
-        if (attempt >= maxAttempts) {
-          // Final attempt ended without a terminal DB status — force failed to
-          // avoid leaving the row orphaned in a non-terminal state.
-          await markPdfJobFailed(
-            job.data.jobId,
-            "worker exited without terminal status",
-            attempt,
-          ).catch((err) =>
-            logger.error({ err, jobDbId: job.data.jobId }, "Orphan guard update failed"),
-          );
-        }
-      }
+      return await optimizeDrivePdfJob(job.data, queueWaitMs);
+    } catch (err) {
+      // Update DB on every failed attempt so the row never stays orphaned
+      // in a non-terminal state between retries. markPdfJobFailed guards
+      // against overwriting completed/skipped, so this is safe to call
+      // unconditionally. persistFinalFailure (called by the 'failed' event)
+      // will overwrite this on the last attempt with the same data.
+      const message = err instanceof Error ? err.message : "PDF optimization failed";
+      await markPdfJobFailed(job.data.jobId, message, attempt).catch((dbErr) =>
+        logger.error({ dbErr, jobDbId: job.data.jobId }, "Failed to mark pdf job as failed before retry"),
+      );
+      throw err;
     }
   },
   {

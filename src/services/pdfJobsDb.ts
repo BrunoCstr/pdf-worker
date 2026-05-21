@@ -1,7 +1,23 @@
 import { logger } from "../utils/logger";
 import { supabase } from "./supabase";
 
-export type PdfJobStatus = "queued" | "downloading" | "compressing" | "uploading" | "completed" | "failed" | "skipped";
+export type PdfJobStatus =
+  | "queued"
+  | "downloading"
+  | "compressing"
+  | "uploading"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "cancelled";
+
+export type PdfJobRow = {
+  id: string;
+  status: PdfJobStatus;
+  attempt: number | null;
+};
+
+const TERMINAL_STATUSES: PdfJobStatus[] = ["completed", "skipped", "cancelled"];
 
 export async function markPdfJobDownloading(
   jobId: string,
@@ -69,6 +85,7 @@ export async function markPdfJobFailed(
     .eq("id", jobId)
     .neq("status", "completed")
     .neq("status", "skipped")
+    .neq("status", "cancelled")
     .select("id");
 
   if (error) {
@@ -83,6 +100,11 @@ export async function markPdfJobFailed(
       .select("status, attempt")
       .eq("id", jobId)
       .maybeSingle();
+
+    if (current?.status === "cancelled") {
+      logger.info({ jobId }, "markPdfJobFailed: skipped because job is cancelled");
+      return;
+    }
 
     logger.error(
       { jobId, currentStatus: current?.status ?? "row_not_found", currentAttempt: current?.attempt },
@@ -105,13 +127,39 @@ export async function markPdfJobSkipped(jobId: string, compressionMessage: strin
 }
 
 export async function updatePdfJobProgress(jobId: string, progress: number): Promise<void> {
-  await supabase.from("drive_pdf_jobs").update({ progress }).eq("id", jobId);
+  const { error } = await addNonTerminalStatusGuards(
+    supabase.from("drive_pdf_jobs").update({ progress }).eq("id", jobId),
+  );
+
+  if (error) {
+    throw new Error(`Failed to update drive_pdf_jobs progress ${jobId}: ${error.message}`);
+  }
+}
+
+export async function getPdfJob(jobId: string): Promise<PdfJobRow | null> {
+  const { data, error } = await supabase
+    .from("drive_pdf_jobs")
+    .select("id, status, attempt")
+    .eq("id", jobId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to read drive_pdf_jobs row ${jobId}: ${error.message}`);
+  }
+
+  return data as PdfJobRow | null;
 }
 
 async function updatePdfJob(jobId: string, patch: Record<string, unknown>): Promise<void> {
-  const { error } = await supabase.from("drive_pdf_jobs").update(patch).eq("id", jobId);
+  const { error } = await addNonTerminalStatusGuards(
+    supabase.from("drive_pdf_jobs").update(patch).eq("id", jobId),
+  );
 
   if (error) {
     throw new Error(`Failed to update drive_pdf_jobs row ${jobId}: ${error.message}`);
   }
+}
+
+function addNonTerminalStatusGuards<T extends { neq: (column: string, value: string) => T }>(query: T): T {
+  return TERMINAL_STATUSES.reduce((guardedQuery, status) => guardedQuery.neq("status", status), query);
 }

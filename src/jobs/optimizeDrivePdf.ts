@@ -1,6 +1,7 @@
 import { performance } from "node:perf_hooks";
 
 import { computeGhostscriptTimeoutMs, config } from "../config";
+import { JobCancelledError } from "../errors";
 import type { DrivePdfOptimizeJob } from "../queue";
 import { compressPdfWithGhostscript } from "../services/compressPdf";
 import {
@@ -16,6 +17,7 @@ import {
   markPdfJobCompressing,
   markPdfJobSkipped,
   markPdfJobUploading,
+  getPdfJob,
   updatePdfJobProgress,
 } from "../services/pdfJobsDb";
 import { downloadStorageFile, uploadStorageFile } from "../services/storage";
@@ -42,6 +44,8 @@ export async function optimizeDrivePdfJob(
 ): Promise<OptimizeDrivePdfResult> {
   const startedAt = performance.now();
 
+  await assertPdfJobNotCancelled(payload.jobId);
+
   if (payload.originalSizeBytes > config.limits.maxPdfBytes) {
     const message = `pdf_too_large:${payload.originalSizeBytes}>${config.limits.maxPdfBytes}`;
 
@@ -64,17 +68,20 @@ export async function optimizeDrivePdfJob(
     return result;
   }
 
+  await assertPdfJobNotCancelled(payload.jobId);
   await markFileProcessing(payload.fileId);
 
   const temp = await createJobTempDir(payload.fileId);
 
   try {
+    await assertPdfJobNotCancelled(payload.jobId);
     const download = await downloadStorageFile({
       bucket: payload.bucket,
       storagePath: payload.storagePath,
       destinationPath: temp.inputPath,
     });
 
+    await assertPdfJobNotCancelled(payload.jobId);
     await markPdfJobCompressingBestEffort(payload.jobId);
 
     const ghostscriptTimeoutMs = computeGhostscriptTimeoutMs(payload.originalSizeBytes);
@@ -88,6 +95,8 @@ export async function optimizeDrivePdfJob(
       },
       ghostscriptTimeoutMs,
     );
+
+    await assertPdfJobNotCancelled(payload.jobId);
 
     if (!compression.applied) {
       await markFileReadyNotSmaller(payload.fileId);
@@ -118,6 +127,7 @@ export async function optimizeDrivePdfJob(
       return result;
     }
 
+    await assertPdfJobNotCancelled(payload.jobId);
     await markPdfJobUploadingBestEffort(payload.jobId);
 
     const upload = await uploadStorageFile({
@@ -126,6 +136,8 @@ export async function optimizeDrivePdfJob(
       sourcePath: temp.outputPath,
       contentType: payload.mimeType,
     });
+
+    await assertPdfJobNotCancelled(payload.jobId);
 
     await markFileReadyApplied({
       fileId: payload.fileId,
@@ -187,17 +199,48 @@ async function compressPdfWithGhostscriptAndReportProgress(
 
   let currentProgress = PROGRESS_START;
   let tick = 0;
+  let checkingCancellation = false;
+  const abortController = new AbortController();
 
   const timer = setInterval(() => {
+    if (checkingCancellation) {
+      return;
+    }
+
+    checkingCancellation = true;
     tick += 1;
     currentProgress = Math.min(PROGRESS_START + Math.round(stepPerTick * tick), PROGRESS_END);
-    updatePdfJobProgress(jobId, currentProgress).catch(() => {});
+
+    void (async () => {
+      try {
+        await assertPdfJobNotCancelled(jobId);
+        await updatePdfJobProgress(jobId, currentProgress);
+      } catch (error) {
+        if (error instanceof JobCancelledError) {
+          abortController.abort(error);
+          return;
+        }
+
+        logger.warn({ error, jobId }, "Failed to update pdf job progress");
+      } finally {
+        checkingCancellation = false;
+      }
+    })();
   }, TICK_MS);
 
   try {
-    return await compressPdfWithGhostscript(options);
+    await assertPdfJobNotCancelled(jobId);
+    return await compressPdfWithGhostscript({ ...options, signal: abortController.signal });
   } finally {
     clearInterval(timer);
+  }
+}
+
+async function assertPdfJobNotCancelled(jobId: string): Promise<void> {
+  const row = await getPdfJob(jobId);
+
+  if (row?.status === "cancelled") {
+    throw new JobCancelledError();
   }
 }
 

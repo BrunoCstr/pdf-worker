@@ -1,11 +1,7 @@
 import { Job, Worker } from "bullmq";
 
 import { config } from "./config";
-
-const workerLockDurationMs = Math.min(
-  config.limits.ghostscriptTimeoutMaxMs,
-  Math.max(120_000, config.limits.ghostscriptTimeoutMs),
-);
+import { isJobCancelledError } from "./errors";
 import { optimizeDrivePdfJob } from "./jobs/optimizeDrivePdf";
 import {
   addFailedJobToDlq,
@@ -18,8 +14,13 @@ import {
   type DrivePdfOptimizeJob,
 } from "./queue";
 import { insertCompressionAuditLog, markFileFailed } from "./services/filesDb";
-import { markPdfJobDownloading, markPdfJobFailed } from "./services/pdfJobsDb";
+import { getPdfJob, markPdfJobDownloading, markPdfJobFailed } from "./services/pdfJobsDb";
 import { logger } from "./utils/logger";
+
+const workerLockDurationMs = Math.min(
+  config.limits.ghostscriptTimeoutMaxMs,
+  Math.max(120_000, config.limits.ghostscriptTimeoutMs),
+);
 
 const workerConnection = createRedisConnection();
 
@@ -46,6 +47,10 @@ const worker = new Worker<DrivePdfOptimizeJob>(
       "Starting PDF optimization job",
     );
 
+    if (await isPdfJobCancelled(job.data.jobId)) {
+      return buildCancelledResult(job.data, queueWaitMs);
+    }
+
     await markPdfJobDownloading(job.data.jobId, { queueWaitMs, attempt });
 
     try {
@@ -57,6 +62,12 @@ const worker = new Worker<DrivePdfOptimizeJob>(
       // unconditionally. persistFinalFailure (called by the 'failed' event)
       // will overwrite this on the last attempt with the same data.
       const message = err instanceof Error ? err.message : "PDF optimization failed";
+
+      if (isJobCancelledError(err) || (await isPdfJobCancelled(job.data.jobId))) {
+        logger.info({ jobId: job.id, jobDbId: job.data.jobId }, "PDF optimization job cancelled");
+        return buildCancelledResult(job.data, queueWaitMs);
+      }
+
       await markPdfJobFailed(job.data.jobId, message, attempt).catch((dbErr) =>
         logger.error({ dbErr, jobDbId: job.data.jobId }, "Failed to mark pdf job as failed before retry"),
       );
@@ -135,6 +146,11 @@ async function handleFailedJob(job: Job<DrivePdfOptimizeJob> | undefined, error:
     return;
   }
 
+  if (isJobCancelledError(error) || (await isPdfJobCancelled(job.data.jobId))) {
+    logger.info({ jobId: job.id, jobDbId: job.data.jobId }, "Skipping final failure persistence for cancelled job");
+    return;
+  }
+
   await persistFinalFailure(job, error);
 }
 
@@ -186,6 +202,29 @@ async function persistFinalFailure(job: Job<DrivePdfOptimizeJob>, error: Error):
   } catch (dlqError) {
     logger.error({ dlqError, jobId: job.id, fileId: job.data.fileId }, "Failed to add job to DLQ");
   }
+}
+
+async function isPdfJobCancelled(jobId: string): Promise<boolean> {
+  const row = await getPdfJob(jobId).catch((error) => {
+    logger.warn({ error, jobDbId: jobId }, "Failed to check pdf job cancellation");
+    return null;
+  });
+
+  return row?.status === "cancelled";
+}
+
+function buildCancelledResult(job: DrivePdfOptimizeJob, queueWaitMs: number) {
+  return {
+    applied: false,
+    skipped: false,
+    cancelled: true,
+    message: "cancelled",
+    originalSize: job.originalSizeBytes,
+    compressedSize: job.originalSizeBytes,
+    reductionRatio: 0,
+    queueWaitMs,
+    durationMs: 0,
+  };
 }
 
 async function shutdown(signal: NodeJS.Signals): Promise<void> {

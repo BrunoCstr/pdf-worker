@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 
 import { config } from "../config";
+import { JobCancelledError } from "../errors";
 
 export const GHOSTSCRIPT_SETTING = "ghostscript-300dpi";
 
@@ -19,11 +20,12 @@ export async function compressPdfWithGhostscript(options: {
   inputPath: string;
   outputPath: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<CompressPdfResult> {
   const startedAt = performance.now();
   const originalStat = await stat(options.inputPath);
 
-  await runGhostscript(options.inputPath, options.outputPath, options.timeoutMs);
+  await runGhostscript(options.inputPath, options.outputPath, options.timeoutMs, options.signal);
 
   const compressedStat = await stat(options.outputPath);
   const reductionRatio = (originalStat.size - compressedStat.size) / originalStat.size;
@@ -44,6 +46,7 @@ async function runGhostscript(
   inputPath: string,
   outputPath: string,
   timeoutMs: number = config.limits.ghostscriptTimeoutMs,
+  signal?: AbortSignal,
 ): Promise<void> {
   const args = [
     "-sDEVICE=pdfwrite",
@@ -79,15 +82,51 @@ async function runGhostscript(
 
     let stderr = "";
     let timedOut = false;
+    let settled = false;
+    let keepKillTimer = false;
+    let timeout: NodeJS.Timeout;
     let killTimer: NodeJS.Timeout | undefined;
 
-    const timeout = setTimeout(() => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      if (!keepKillTimer) {
+        clearTimeout(killTimer);
+      }
+      signal?.removeEventListener("abort", abortGhostscript);
+    };
+
+    const rejectOnce = (error: Error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    const abortGhostscript = () => {
+      const reason = signal?.reason instanceof Error ? signal.reason : new JobCancelledError();
+      child.kill("SIGTERM");
+      keepKillTimer = true;
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      rejectOnce(reason);
+    };
+
+    timeout = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
       // If GS ignores SIGTERM (e.g. blocked on disk I/O), force-kill after 5s
       // to guarantee the promise always settles and the worker is never frozen.
       killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
     }, timeoutMs);
+
+    if (signal?.aborted) {
+      abortGhostscript();
+      return;
+    }
+
+    signal?.addEventListener("abort", abortGhostscript, { once: true });
 
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
@@ -98,14 +137,16 @@ async function runGhostscript(
     });
 
     child.on("error", (error) => {
-      clearTimeout(timeout);
-      clearTimeout(killTimer);
-      reject(error);
+      rejectOnce(error);
     });
 
     child.on("close", (code, signal) => {
-      clearTimeout(timeout);
-      clearTimeout(killTimer);
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
 
       if (timedOut) {
         reject(new Error(`Ghostscript timed out after ${timeoutMs}ms`));

@@ -6,6 +6,7 @@ import { config } from "./config";
 import { createRedisConnection } from "./redis";
 
 export type DrivePdfOptimizeJob = {
+  jobId: string;
   fileId: string;
   userId: string;
   storagePath: string;
@@ -43,6 +44,10 @@ export function validateJobData(data: unknown): asserts data is DrivePdfOptimize
   }
 
   const payload = data as Partial<DrivePdfOptimizeJob>;
+
+  if (!payload.jobId || typeof payload.jobId !== "string") {
+    throw new Error("Job payload is missing jobId");
+  }
 
   if (!payload.fileId || typeof payload.fileId !== "string") {
     throw new Error("Job payload is missing fileId");

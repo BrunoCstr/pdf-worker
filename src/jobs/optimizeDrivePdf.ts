@@ -11,6 +11,12 @@ import {
   markFileReadyNotSmaller,
   markFileSkipped,
 } from "../services/filesDb";
+import {
+  markPdfJobCompleted,
+  markPdfJobCompressing,
+  markPdfJobSkipped,
+  markPdfJobUploading,
+} from "../services/pdfJobsDb";
 import { downloadStorageFile, uploadStorageFile } from "../services/storage";
 import { logger } from "../utils/logger";
 import { createJobTempDir } from "../utils/tempFiles";
@@ -37,7 +43,10 @@ export async function optimizeDrivePdfJob(
 
   if (payload.originalSizeBytes > config.limits.maxPdfBytes) {
     const message = `pdf_too_large:${payload.originalSizeBytes}>${config.limits.maxPdfBytes}`;
+
     await markFileSkipped(payload.fileId, message);
+    const durationMs = Math.round(performance.now() - startedAt);
+    await markPdfJobSkippedBestEffort(payload.jobId, message);
 
     const result: OptimizeDrivePdfResult = {
       applied: false,
@@ -47,7 +56,7 @@ export async function optimizeDrivePdfJob(
       compressedSize: payload.originalSizeBytes,
       reductionRatio: 0,
       queueWaitMs,
-      durationMs: Math.round(performance.now() - startedAt),
+      durationMs,
     };
 
     await insertAuditLogBestEffort(payload, result);
@@ -65,6 +74,8 @@ export async function optimizeDrivePdfJob(
       destinationPath: temp.inputPath,
     });
 
+    await markPdfJobCompressingBestEffort(payload.jobId);
+
     const compression = await compressPdfWithGhostscript({
       inputPath: temp.inputPath,
       outputPath: temp.outputPath,
@@ -72,6 +83,15 @@ export async function optimizeDrivePdfJob(
 
     if (!compression.applied) {
       await markFileReadyNotSmaller(payload.fileId);
+      const durationMs = Math.round(performance.now() - startedAt);
+
+      await markPdfJobCompletedBestEffort(payload.jobId, {
+        compressedSizeBytes: compression.originalSize,
+        compressionRatio: null,
+        compressionSetting: null,
+        compressionMessage: "not_smaller",
+        processingMs: durationMs,
+      });
 
       const result: OptimizeDrivePdfResult = {
         applied: false,
@@ -81,7 +101,7 @@ export async function optimizeDrivePdfJob(
         compressedSize: compression.compressedSize,
         reductionRatio: compression.reductionRatio,
         queueWaitMs,
-        durationMs: Math.round(performance.now() - startedAt),
+        durationMs,
         downloadMs: download.downloadMs,
         ghostscriptMs: compression.ghostscriptMs,
       };
@@ -89,6 +109,8 @@ export async function optimizeDrivePdfJob(
       await insertAuditLogBestEffort(payload, result);
       return result;
     }
+
+    await markPdfJobUploadingBestEffort(payload.jobId);
 
     const upload = await uploadStorageFile({
       bucket: payload.bucket,
@@ -109,6 +131,16 @@ export async function optimizeDrivePdfJob(
       await adjustUserStorageUsedBytes(payload.userId, quotaDelta);
     }
 
+    const durationMs = Math.round(performance.now() - startedAt);
+
+    await markPdfJobCompletedBestEffort(payload.jobId, {
+      compressedSizeBytes: compression.compressedSize,
+      compressionRatio: compression.reductionRatio,
+      compressionSetting: compression.setting,
+      compressionMessage: null,
+      processingMs: durationMs,
+    });
+
     const result: OptimizeDrivePdfResult = {
       applied: true,
       skipped: false,
@@ -116,7 +148,7 @@ export async function optimizeDrivePdfJob(
       compressedSize: compression.compressedSize,
       reductionRatio: compression.reductionRatio,
       queueWaitMs,
-      durationMs: Math.round(performance.now() - startedAt),
+      durationMs,
       downloadMs: download.downloadMs,
       ghostscriptMs: compression.ghostscriptMs,
       uploadMs: upload.uploadMs,
@@ -126,6 +158,41 @@ export async function optimizeDrivePdfJob(
     return result;
   } finally {
     await temp.cleanup();
+  }
+}
+
+async function markPdfJobCompressingBestEffort(jobId: string): Promise<void> {
+  try {
+    await markPdfJobCompressing(jobId);
+  } catch (error) {
+    logger.warn({ error, jobId }, "Failed to mark pdf job as compressing");
+  }
+}
+
+async function markPdfJobUploadingBestEffort(jobId: string): Promise<void> {
+  try {
+    await markPdfJobUploading(jobId);
+  } catch (error) {
+    logger.warn({ error, jobId }, "Failed to mark pdf job as uploading");
+  }
+}
+
+async function markPdfJobCompletedBestEffort(
+  jobId: string,
+  options: Parameters<typeof markPdfJobCompleted>[1],
+): Promise<void> {
+  try {
+    await markPdfJobCompleted(jobId, options);
+  } catch (error) {
+    logger.warn({ error, jobId }, "Failed to mark pdf job as completed");
+  }
+}
+
+async function markPdfJobSkippedBestEffort(jobId: string, message: string): Promise<void> {
+  try {
+    await markPdfJobSkipped(jobId, message);
+  } catch (error) {
+    logger.warn({ error, jobId }, "Failed to mark pdf job as skipped");
   }
 }
 

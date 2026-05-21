@@ -12,6 +12,7 @@ import {
   type DrivePdfOptimizeJob,
 } from "./queue";
 import { insertCompressionAuditLog, markFileFailed } from "./services/filesDb";
+import { markPdfJobDownloading, markPdfJobFailed } from "./services/pdfJobsDb";
 import { logger } from "./utils/logger";
 
 const workerConnection = createRedisConnection();
@@ -22,18 +23,46 @@ const worker = new Worker<DrivePdfOptimizeJob>(
     validateJobData(job.data);
 
     const queueWaitMs = Math.max(0, Date.now() - Date.parse(job.data.enqueuedAt));
+    // BullMQ increments attemptsMade before the processor runs, so attemptsMade
+    // already reflects the current attempt number (1-based).
+    const attempt = job.attemptsMade;
+
     logger.info(
       {
         jobId: job.id,
+        jobDbId: job.data.jobId,
         fileId: job.data.fileId,
         userId: job.data.userId,
         storagePath: job.data.storagePath,
         queue_wait_ms: queueWaitMs,
+        attempt,
       },
       "Starting PDF optimization job",
     );
 
-    return optimizeDrivePdfJob(job.data, queueWaitMs);
+    await markPdfJobDownloading(job.data.jobId, { queueWaitMs, attempt });
+
+    let terminalReached = false;
+    try {
+      const result = await optimizeDrivePdfJob(job.data, queueWaitMs);
+      terminalReached = true;
+      return result;
+    } finally {
+      if (!terminalReached) {
+        const maxAttempts = job.opts.attempts ?? 1;
+        if (attempt >= maxAttempts) {
+          // Final attempt ended without a terminal DB status — force failed to
+          // avoid leaving the row orphaned in a non-terminal state.
+          await markPdfJobFailed(
+            job.data.jobId,
+            "worker exited without terminal status",
+            attempt,
+          ).catch((err) =>
+            logger.error({ err, jobDbId: job.data.jobId }, "Orphan guard update failed"),
+          );
+        }
+      }
+    }
   },
   {
     connection: workerConnection,
@@ -45,6 +74,7 @@ worker.on("completed", (job, result) => {
   logger.info(
     {
       jobId: job.id,
+      jobDbId: job.data.jobId,
       fileId: job.data.fileId,
       storagePath: job.data.storagePath,
       queue_wait_ms: result.queueWaitMs,
@@ -82,6 +112,7 @@ async function handleFailedJob(job: Job<DrivePdfOptimizeJob> | undefined, error:
     {
       error,
       jobId: job.id,
+      jobDbId: job.data?.jobId,
       fileId: job.data?.fileId,
       storagePath: job.data?.storagePath,
       attemptsMade: job.attemptsMade,
@@ -108,11 +139,21 @@ async function handleFailedJob(job: Job<DrivePdfOptimizeJob> | undefined, error:
 async function persistFinalFailure(job: Job<DrivePdfOptimizeJob>, error: Error): Promise<void> {
   const message = error.message || "PDF optimization failed";
   const queueWaitMs = Math.max(0, Date.now() - Date.parse(job.data.enqueuedAt));
+  const attempt = job.attemptsMade;
 
   try {
     await markFileFailed(job.data.fileId, message);
   } catch (markError) {
     logger.error({ markError, jobId: job.id, fileId: job.data.fileId }, "Failed to mark file as failed");
+  }
+
+  try {
+    await markPdfJobFailed(job.data.jobId, message, attempt);
+  } catch (markError) {
+    logger.error(
+      { markError, jobId: job.id, jobDbId: job.data.jobId },
+      "Failed to mark pdf job as failed",
+    );
   }
 
   try {

@@ -62,6 +62,41 @@ export async function downloadStorageFile(options: {
   }
 }
 
+export async function downloadHttpFile(options: {
+  url: string;
+  destinationPath: string;
+}): Promise<StorageDownloadResult> {
+  const parsed = new URL(options.url);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("External material URL must use http or https");
+  }
+
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.limits.downloadTimeoutMs);
+
+  try {
+    const response = await fetch(parsed, { signal: controller.signal });
+    if (!response.ok || !response.body) {
+      throw new Error(`External material download failed with status ${response.status}`);
+    }
+
+    await pipeline(
+      Readable.fromWeb(response.body as unknown as NodeReadableStream<Uint8Array>),
+      createWriteStream(options.destinationPath),
+    );
+    const fileStat = await stat(options.destinationPath);
+    return { bytes: fileStat.size, downloadMs: Math.round(performance.now() - startedAt) };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`External material download timed out after ${config.limits.downloadTimeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function uploadStorageFile(options: {
   bucket: string;
   storagePath: string;
@@ -85,4 +120,10 @@ export async function uploadStorageFile(options: {
   return {
     uploadMs: Math.round(performance.now() - startedAt),
   };
+}
+
+export async function removeStorageFiles(bucket: string, paths: string[]): Promise<void> {
+  if (paths.length === 0) return;
+  const { error } = await supabase.storage.from(bucket).remove(paths);
+  if (error) throw new Error(`Storage cleanup failed: ${error.message}`);
 }

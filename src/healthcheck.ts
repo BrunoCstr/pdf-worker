@@ -34,13 +34,15 @@ async function main(): Promise<void> {
     await redis.connect();
     await redis.ping();
 
-    const { error } = await supabase.storage.from(config.supabase.bucket).list("", {
-      limit: 1,
-    });
-    if (error) {
-      throw new Error(
-        `Supabase storage check failed for bucket "${config.supabase.bucket}": ${error.message}`,
-      );
+    for (const bucket of [
+      config.supabase.bucket,
+      config.materialDownloads.sourceBucket,
+      config.materialDownloads.outputBucket,
+    ]) {
+      const { error } = await supabase.storage.from(bucket).list("", { limit: 1 });
+      if (error) {
+        throw new Error(`Supabase storage check failed for bucket "${bucket}": ${error.message}`);
+      }
     }
   } finally {
     redis.disconnect();

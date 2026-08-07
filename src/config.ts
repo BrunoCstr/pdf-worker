@@ -8,6 +8,14 @@ export type AppConfig = {
   queueName: string;
   dlqName: string;
   workerConcurrency: number;
+  materialDownloads: {
+    queueName: string;
+    workerConcurrency: number;
+    sourceBucket: string;
+    outputBucket: string;
+    maxPdfBytes: number;
+    cleanupIntervalMs: number;
+  };
   supabase: {
     url: string;
     /** Chave server-side (SUPABASE_SECRET_KEY no app principal). */
@@ -235,6 +243,14 @@ export const config: AppConfig = {
   queueName: readOptional("BULLMQ_QUEUE_NAME") ?? "drive-pdf-optimize",
   dlqName: readOptional("BULLMQ_DLQ_NAME") ?? "drive-pdf-failed",
   workerConcurrency: readNumber("WORKER_CONCURRENCY", 1, { min: 1 }),
+  materialDownloads: {
+    queueName: readOptional("MATERIAL_PDF_QUEUE_NAME") ?? "material-pdf-watermark",
+    workerConcurrency: readNumber("MATERIAL_WORKER_CONCURRENCY", 1, { min: 1 }),
+    sourceBucket: readOptional("SUPABASE_LESSON_MATERIALS_BUCKET") ?? "lesson-materials",
+    outputBucket: readOptional("SUPABASE_MATERIAL_DOWNLOADS_BUCKET") ?? "lesson-material-downloads",
+    maxPdfBytes: readNumber("MATERIAL_WATERMARK_MAX_BYTES", 52_428_800, { min: 1 }),
+    cleanupIntervalMs: readNumber("MATERIAL_DOWNLOAD_CLEANUP_INTERVAL_MS", 900_000, { min: 60_000 }),
+  },
   supabase: {
     url: readRequired("SUPABASE_URL"),
     secretKey: readSupabaseSecretKey(),

@@ -3,6 +3,8 @@ import { Job, Worker } from "bullmq";
 import { config } from "./config";
 import { isJobCancelledError } from "./errors";
 import { optimizeDrivePdfJob } from "./jobs/optimizeDrivePdf";
+import { watermarkMaterialPdfJob } from "./jobs/watermarkMaterialPdf";
+import { validateMaterialJobData, type MaterialPdfWatermarkJob } from "./materialQueue";
 import {
   addFailedJobToDlq,
   createRedisConnection,
@@ -16,6 +18,13 @@ import {
 import { GHOSTSCRIPT_SETTING, smokeTestGhostscript } from "./services/compressPdf";
 import { insertCompressionAuditLog, markFileFailed } from "./services/filesDb";
 import { getPdfJob, markPdfJobDownloading, markPdfJobFailed } from "./services/pdfJobsDb";
+import {
+  listExpiredMaterialDownloads,
+  markMaterialDownloadFailed,
+  markMaterialDownloadQueuedForRetry,
+  markMaterialDownloadsExpired,
+} from "./services/materialDownloadsDb";
+import { removeStorageFiles } from "./services/storage";
 import { logger } from "./utils/logger";
 
 const workerLockDurationMs = Math.min(
@@ -24,8 +33,11 @@ const workerLockDurationMs = Math.min(
 );
 
 const workerConnection = createRedisConnection();
+const materialWorkerConnection = createRedisConnection();
 
 let worker: Worker<DrivePdfOptimizeJob> | undefined;
+let materialWorker: Worker<MaterialPdfWatermarkJob> | undefined;
+let materialCleanupTimer: NodeJS.Timeout | undefined;
 
 function createPdfOptimizeWorker(): Worker<DrivePdfOptimizeJob> {
   const w = new Worker<DrivePdfOptimizeJob>(
@@ -119,6 +131,75 @@ function createPdfOptimizeWorker(): Worker<DrivePdfOptimizeJob> {
   });
 
   return w;
+}
+
+function createMaterialWatermarkWorker(): Worker<MaterialPdfWatermarkJob> {
+  const w = new Worker<MaterialPdfWatermarkJob>(
+    config.materialDownloads.queueName,
+    async (job) => {
+      validateMaterialJobData(job.data);
+      const attempt = job.attemptsMade + 1;
+      const attempts = job.opts.attempts ?? 1;
+
+      try {
+        return await watermarkMaterialPdfJob(job.data, attempt);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Material watermark failed";
+        if (attempt >= attempts) {
+          await markMaterialDownloadFailed(job.data.jobId, attempt, message).catch((dbError) =>
+            logger.error({ dbError, jobId: job.data.jobId }, "Failed to mark material job as failed"),
+          );
+        } else {
+          await markMaterialDownloadQueuedForRetry(job.data.jobId, attempt, message).catch((dbError) =>
+            logger.warn({ dbError, jobId: job.data.jobId }, "Failed to mark material job for retry"),
+          );
+        }
+        throw error;
+      }
+    },
+    {
+      connection: materialWorkerConnection,
+      concurrency: config.materialDownloads.workerConcurrency,
+      lockDuration: 120_000,
+    },
+  );
+
+  w.on("completed", (job, result) => {
+    logger.info(
+      {
+        jobId: job.data.jobId,
+        materialId: job.data.materialId,
+        userId: job.data.userId,
+        output_bytes: result.outputBytes,
+        page_count: result.pageCount,
+        download_ms: result.downloadMs,
+        upload_ms: result.uploadMs,
+        duration_ms: result.durationMs,
+        idempotent: result.idempotent,
+      },
+      "Completed material PDF watermark job",
+    );
+  });
+  w.on("failed", (job, error) => {
+    logger.error(
+      { error, jobId: job?.data.jobId, materialId: job?.data.materialId, attemptsMade: job?.attemptsMade },
+      "Material PDF watermark job failed",
+    );
+  });
+  w.on("error", (error) => logger.error({ error }, "Material watermark worker error"));
+  return w;
+}
+
+async function cleanupExpiredMaterialDownloads(): Promise<void> {
+  const expired = await listExpiredMaterialDownloads();
+  if (expired.length === 0) return;
+
+  await removeStorageFiles(
+    config.materialDownloads.outputBucket,
+    expired.map((row) => row.outputPath),
+  );
+  await markMaterialDownloadsExpired(expired.map((row) => row.id));
+  logger.info({ count: expired.length }, "Expired material PDF downloads cleaned up");
 }
 
 async function handleFailedJob(job: Job<DrivePdfOptimizeJob> | undefined, error: Error): Promise<void> {
@@ -242,9 +323,14 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   if (worker) {
     await worker.close();
   }
+  if (materialWorker) {
+    await materialWorker.close();
+  }
+  if (materialCleanupTimer) clearInterval(materialCleanupTimer);
   await pdfOptimizeQueue.close();
   await deadLetterQueue.close();
   await workerConnection.quit();
+  await materialWorkerConnection.quit();
   await redisConnection.quit();
   await dlqConnection.quit();
 
@@ -288,6 +374,16 @@ async function bootstrap(): Promise<void> {
   }
 
   worker = createPdfOptimizeWorker();
+  materialWorker = createMaterialWatermarkWorker();
+  await cleanupExpiredMaterialDownloads().catch((error) =>
+    logger.warn({ error }, "Initial material download cleanup failed"),
+  );
+  materialCleanupTimer = setInterval(() => {
+    void cleanupExpiredMaterialDownloads().catch((error) =>
+      logger.warn({ error }, "Scheduled material download cleanup failed"),
+    );
+  }, config.materialDownloads.cleanupIntervalMs);
+  materialCleanupTimer.unref();
 
   logger.info(
     {
@@ -296,6 +392,9 @@ async function bootstrap(): Promise<void> {
       concurrency: config.workerConcurrency,
       bucket: config.supabase.bucket,
       maxPdfBytes: config.limits.maxPdfBytes,
+      materialQueueName: config.materialDownloads.queueName,
+      materialConcurrency: config.materialDownloads.workerConcurrency,
+      materialOutputBucket: config.materialDownloads.outputBucket,
     },
     "PDF worker started",
   );

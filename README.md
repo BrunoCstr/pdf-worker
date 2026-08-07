@@ -1,6 +1,9 @@
 # pdf-worker
 
-Worker BullMQ em Node.js 22/TypeScript para otimizar PDFs do Drive do app `tropa-do-soi`. Ele consome a fila `drive-pdf-optimize`, baixa PDFs do bucket privado `user-files`, roda Ghostscript localmente e substitui o objeto no mesmo `storage_path` apenas quando a redução for de pelo menos 5%.
+Worker BullMQ em Node.js 22/TypeScript para dois fluxos do app `tropa-do-soi`:
+
+- `drive-pdf-optimize`: otimiza PDFs do Drive com Ghostscript;
+- `material-pdf-watermark`: aplica a marca d'água individual dos materiais e grava uma cópia temporária no bucket privado `lesson-material-downloads`.
 
 ## Arquitetura
 
@@ -18,6 +21,12 @@ Next.js (Vercel)                    VPS (Hetzner/Coolify)
      │                                      └─ DLQ drive-pdf-failed
      └─ poll / Realtime ◄── Postgres ───────┘
 ```
+
+No fluxo de materiais, a Vercel apenas valida o acesso e enfileira um job. O worker lê usuário e
+material no Postgres, baixa o original de `lesson-materials`, aplica a marca d'água com `pdf-lib`,
+grava o resultado em `lesson-material-downloads` e marca `material_download_jobs` como `ready`.
+O navegador baixa por URL assinada diretamente do Storage. Um processo periódico remove objetos
+cujo `expires_at` já passou.
 
 O Redis precisa ser alcançável pela Vercel e pela VPS. Use Redis gerenciado com TLS, como Upstash ou Redis Cloud, ou exponha Redis com firewall e senha forte.
 
@@ -44,8 +53,13 @@ Veja `.env.example`. Valores importantes:
 - `BULLMQ_QUEUE_NAME=drive-pdf-optimize`
 - `BULLMQ_DLQ_NAME=drive-pdf-failed`
 - `WORKER_CONCURRENCY=1`
+- `MATERIAL_PDF_QUEUE_NAME=material-pdf-watermark`
+- `MATERIAL_WORKER_CONCURRENCY=1`
 - `SUPABASE_URL` e `SUPABASE_SECRET_KEY` (a mesma chave server-side do `tropa-do-soi`; nao use `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` no worker)
 - `SUPABASE_BUCKET=user-files`
+- `SUPABASE_LESSON_MATERIALS_BUCKET=lesson-materials`
+- `SUPABASE_MATERIAL_DOWNLOADS_BUCKET=lesson-material-downloads`
+- `MATERIAL_WATERMARK_MAX_BYTES=52428800`
 - `DRIVE_PDF_COMPRESS_MAX_BYTES=524288000`
 - `DRIVE_MIN_COMPRESSION_REDUCTION=0.05`
 - `DRIVE_PDF_OPTIMIZER_TIMEOUT_MS=300000`
@@ -53,7 +67,11 @@ Veja `.env.example`. Valores importantes:
 
 ## Migração no App Principal
 
-Aplicar no banco usado pelo `tropa-do-soi` antes de ligar o worker:
+Aplicar as migrations do banco usadas pelo `tropa-do-soi` antes de ligar o worker. Para materiais,
+isso inclui `20260806150000_material_download_jobs.sql`, que cria o bucket temporário, a tabela de
+jobs e as RPCs de contagem atômica.
+
+Para o Drive, a estrutura esperada continua sendo:
 
 ```sql
 alter table public.files

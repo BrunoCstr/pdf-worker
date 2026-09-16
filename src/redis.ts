@@ -2,8 +2,17 @@ import IORedis, { type RedisOptions } from "ioredis";
 
 import { config } from "./config";
 
+// Certificado do Redis self-hosted (Coolify) expirado desde 2026-08-19 e sem
+// renovação automática (Traefik ACME quebrado) — só troca metadados aqui
+// (jobId/fileId/userId + HMAC), nunca o binário do PDF, então aceitar sem
+// validar o certificado é um trade-off aceitável.
+const tlsOptions: RedisOptions = config.redis.url.startsWith("rediss://")
+  ? { tls: { rejectUnauthorized: false } }
+  : {};
+
 const bullmqOptions: RedisOptions = {
   maxRetriesPerRequest: null,
+  ...tlsOptions,
 };
 
 const probeOptions: RedisOptions = {
@@ -11,6 +20,7 @@ const probeOptions: RedisOptions = {
   connectTimeout: 10_000,
   lazyConnect: true,
   retryStrategy: () => null,
+  ...tlsOptions,
 };
 
 export function createRedisConnection(options?: RedisOptions): IORedis {
